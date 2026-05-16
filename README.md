@@ -1,5 +1,7 @@
 # OpenCodex
 
+**中文** | [English](docs/README_EN.md)
+
 OpenCodex 是一个 Codex 运行环境的轻量实现，通过它能把官方 Codex Renderer 运行在普通 Web 环境中，使用户可以通过任意设备、任意网络，远程访问并操作目标机器上运行的 Codex。
 
 一句话概括：
