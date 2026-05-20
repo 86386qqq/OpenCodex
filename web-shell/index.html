@@ -372,6 +372,7 @@
       (() => {
         const tokenKey = "codex_web_auth_token";
         const expiresKey = "codex_web_auth_expires_at";
+        const forceLoginKey = "codex_web_force_login";
         const settingsKey = "opencodex_web_settings_v1";
         const defaultSettings = {
           mobileKeyboardOptimization: true,
@@ -494,6 +495,20 @@
           clearPersistedToken();
         }
 
+        function shouldForceLogin() {
+          try {
+            return localStorage.getItem(forceLoginKey) === "1";
+          } catch {
+            return false;
+          }
+        }
+
+        function clearForceLogin() {
+          try {
+            localStorage.removeItem(forceLoginKey);
+          } catch {}
+        }
+
         function authHeaders(extra) {
           const headers = new Headers(extra || {});
           const token = storedToken();
@@ -574,6 +589,7 @@
           if (!res.ok || !body || body.ok === false) {
             throw new Error((body && body.error) || `登录失败：HTTP ${res.status}`);
           }
+          clearForceLogin();
           if (body.token) storeToken(body.token);
         }
 
@@ -613,6 +629,12 @@
         (async () => {
           try {
             const state = await authStatus();
+            if (state.authRequired !== false && shouldForceLogin()) {
+              clearToken();
+              showLogin("");
+              return;
+            }
+            clearForceLogin();
             if (state.authenticated || state.authRequired === false) {
               await bootRenderer();
               return;

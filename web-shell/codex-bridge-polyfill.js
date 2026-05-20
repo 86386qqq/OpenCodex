@@ -9,7 +9,19 @@
     });
   const AUTH_TOKEN_STORAGE_KEY = "codex_web_auth_token";
   const AUTH_EXPIRES_STORAGE_KEY = "codex_web_auth_expires_at";
+  const AUTH_FORCE_LOGIN_STORAGE_KEY = "codex_web_force_login";
   const OPENCODEX_SETTINGS_STORAGE_KEY = "opencodex_web_settings_v1";
+  const GATEWAY_AUTH_LOGOUT_LABEL = "退出认证";
+  const GATEWAY_AUTH_LOGOUT_BUSY_LABEL = "正在退出认证...";
+  const OFFICIAL_LOGOUT_LABELS = [
+    "退出登录",
+    "Log out",
+    "Logout",
+    "Sign out",
+    "Sign Out",
+    "Sign out of Codex",
+    "Log out of Codex",
+  ];
   const OPENCODEX_DEFAULT_SETTINGS = {
     mobileKeyboardOptimization: true,
     mobileSidebarAutoCollapse: true,
@@ -53,6 +65,23 @@
       if (!result.has("x-codex-web-token")) result.set("x-codex-web-token", token);
     }
     return result;
+  }
+
+  function clearGatewayAuthToken() {
+    try {
+      cfg.authToken = "";
+      cfg.authExpiresAtMs = 0;
+    } catch {}
+    try {
+      sessionStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+      sessionStorage.removeItem(AUTH_EXPIRES_STORAGE_KEY);
+    } catch {}
+  }
+
+  function forceGatewayLoginOnNextBoot() {
+    try {
+      localStorage.setItem(AUTH_FORCE_LOGIN_STORAGE_KEY, "1");
+    } catch {}
   }
 
   /** 官方 renderer 依赖 crypto.randomUUID，旧浏览器缺失时在 web-shell 侧补齐。 */
@@ -369,6 +398,214 @@
     ).trim();
   }
 
+  function officialLogoutLabelFromElement(element) {
+    const label = elementTextLabel(element).replace(/\s+/g, " ").trim();
+    if (!label || label === GATEWAY_AUTH_LOGOUT_LABEL) return "";
+    return OFFICIAL_LOGOUT_LABELS.find((text) => label === text || label.includes(text)) || "";
+  }
+
+  function isMenuLikeContext(element) {
+    for (let node = element && element.parentElement; node && node !== document.body; node = node.parentElement) {
+      const role = String(node.getAttribute?.("role") || "").toLowerCase();
+      if (role === "menu" || role === "menubar") return true;
+      if (node.hasAttribute?.("data-radix-menu-content") || node.hasAttribute?.("data-radix-popper-content-wrapper")) {
+        return true;
+      }
+      const className = String(node.className || "");
+      if (role === "dialog" || /\bcodex-dialog\b/i.test(className)) return false;
+      if (/\b(dropdown|menu|popover)\b/i.test(className)) return true;
+    }
+    return false;
+  }
+
+  function isOfficialLogoutMenuItem(element) {
+    if (!element || element.nodeType !== 1) return false;
+    if (element.dataset?.codexWebGatewayAuthLogout === "true") return false;
+    if (!visibleElement(element)) return false;
+    if (!officialLogoutLabelFromElement(element)) return false;
+    if (!isMenuLikeContext(element)) return false;
+    const tagName = String(element.tagName || "").toLowerCase();
+    const role = String(element.getAttribute?.("role") || "").toLowerCase();
+    return tagName === "button" || tagName === "a" || role === "menuitem" || role === "menuitemradio";
+  }
+
+  function removeDuplicatedIdentityAttributes(element) {
+    if (!element || element.nodeType !== 1) return;
+    element.removeAttribute("id");
+    element.removeAttribute("data-testid");
+    element.querySelectorAll?.("[id],[data-testid]").forEach((child) => {
+      child.removeAttribute("id");
+      child.removeAttribute("data-testid");
+    });
+  }
+
+  function replaceMenuItemText(element, fromText, toText) {
+    const textNodes = [];
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+    let node = walker.nextNode();
+    while (node) {
+      if (String(node.nodeValue || "").includes(fromText)) textNodes.push(node);
+      node = walker.nextNode();
+    }
+    if (textNodes.length === 0) {
+      element.textContent = toText;
+      return;
+    }
+    for (const textNode of textNodes) {
+      textNode.nodeValue = String(textNode.nodeValue || "").replace(fromText, toText);
+    }
+  }
+
+  function markGatewayAuthLogoutBusy(item, busy) {
+    if (!item) return;
+    item.toggleAttribute("disabled", busy);
+    item.setAttribute("aria-disabled", busy ? "true" : "false");
+    const originalLabel = item.dataset.codexWebGatewayAuthOriginalLabel || GATEWAY_AUTH_LOGOUT_LABEL;
+    replaceMenuItemText(item, busy ? originalLabel : GATEWAY_AUTH_LOGOUT_BUSY_LABEL, busy ? GATEWAY_AUTH_LOGOUT_BUSY_LABEL : originalLabel);
+  }
+
+  async function logoutGatewayAuthFromMenu(item) {
+    if (w.__codexGatewayAuthLogoutInProgress) return;
+    w.__codexGatewayAuthLogoutInProgress = true;
+    markGatewayAuthLogoutBusy(item, true);
+    try {
+      const res = await w.fetch("/api/auth/logout", {
+        method: "POST",
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: gatewayAuthHeaders({ accept: "application/json" }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      clearGatewayAuthToken();
+      forceGatewayLoginOnNextBoot();
+      w.location.replace("/");
+    } catch (error) {
+      w.__codexGatewayAuthLogoutInProgress = false;
+      markGatewayAuthLogoutBusy(item, false);
+      renderBridgeErrorToast({
+        description: `退出认证失败：${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  }
+
+  function stopGatewayAuthLogoutEvent(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === "function") event.stopImmediatePropagation();
+  }
+
+  function gatewayAuthLogoutItemFromEvent(event) {
+    const target = event && event.target;
+    const element = target && target.nodeType === 1 ? target : target?.parentElement;
+    return element && typeof element.closest === "function"
+      ? element.closest('[data-codex-web-gateway-auth-logout="true"]')
+      : null;
+  }
+
+  function handleGatewayAuthLogoutPointer(event) {
+    const item = gatewayAuthLogoutItemFromEvent(event);
+    if (!item) return;
+    stopGatewayAuthLogoutEvent(event);
+    logoutGatewayAuthFromMenu(item);
+  }
+
+  function handleGatewayAuthLogoutKeydown(event) {
+    const item = gatewayAuthLogoutItemFromEvent(event);
+    if (!item || (event.key !== "Enter" && event.key !== " ")) return;
+    stopGatewayAuthLogoutEvent(event);
+    logoutGatewayAuthFromMenu(item);
+  }
+
+  function createGatewayAuthLogoutMenuItem(logoutItem) {
+    const officialLabel = officialLogoutLabelFromElement(logoutItem) || "退出登录";
+    const item = logoutItem.cloneNode(true);
+    item.dataset.codexWebGatewayAuthLogout = "true";
+    item.dataset.codexWebGatewayAuthOriginalLabel = GATEWAY_AUTH_LOGOUT_LABEL;
+    item.setAttribute("aria-label", GATEWAY_AUTH_LOGOUT_LABEL);
+    item.setAttribute("title", GATEWAY_AUTH_LOGOUT_LABEL);
+    item.removeAttribute("disabled");
+    item.removeAttribute("aria-disabled");
+    removeDuplicatedIdentityAttributes(item);
+    replaceMenuItemText(item, officialLabel, GATEWAY_AUTH_LOGOUT_LABEL);
+    if (String(item.tagName || "").toLowerCase() === "button") item.type = "button";
+    item.addEventListener("pointerdown", (event) => {
+      stopGatewayAuthLogoutEvent(event);
+      logoutGatewayAuthFromMenu(item);
+    });
+    item.addEventListener("click", (event) => {
+      stopGatewayAuthLogoutEvent(event);
+      logoutGatewayAuthFromMenu(item);
+    });
+    item.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      stopGatewayAuthLogoutEvent(event);
+      logoutGatewayAuthFromMenu(item);
+    });
+    return item;
+  }
+
+  function injectGatewayAuthLogoutMenuItem(logoutItem) {
+    const parent = logoutItem && logoutItem.parentElement;
+    if (!parent) return false;
+    if (Array.from(parent.children || []).some((child) => child.dataset?.codexWebGatewayAuthLogout === "true")) {
+      return false;
+    }
+    parent.insertBefore(createGatewayAuthLogoutMenuItem(logoutItem), logoutItem);
+    return true;
+  }
+
+  function scanGatewayAuthLogoutMenuItems(root = document) {
+    const scope = root && root.nodeType === 1 ? root : document;
+    const candidates = Array.from(scope.querySelectorAll?.("button,a,[role='menuitem'],[role='menuitemradio']") || []);
+    if (scope !== document && isOfficialLogoutMenuItem(scope)) candidates.unshift(scope);
+    let injected = 0;
+    for (const candidate of candidates) {
+      if (isOfficialLogoutMenuItem(candidate) && injectGatewayAuthLogoutMenuItem(candidate)) injected += 1;
+    }
+    return injected;
+  }
+
+  function installGatewayAuthMenuInjection() {
+    if (!document || document.__codexGatewayAuthMenuInjectionInstalled) return;
+    document.__codexGatewayAuthMenuInjectionInstalled = true;
+    let scheduled = false;
+    const scheduleScan = () => {
+      if (scheduled) return;
+      scheduled = true;
+      const run = () => {
+        scheduled = false;
+        scanGatewayAuthLogoutMenuItems(document);
+      };
+      if (typeof w.requestAnimationFrame === "function") {
+        w.requestAnimationFrame(run);
+      } else {
+        w.setTimeout(run, 0);
+      }
+    };
+    const start = () => {
+      scheduleScan();
+      document.addEventListener("pointerdown", handleGatewayAuthLogoutPointer, true);
+      document.addEventListener("click", handleGatewayAuthLogoutPointer, true);
+      document.addEventListener("keydown", handleGatewayAuthLogoutKeydown, true);
+      const observer = new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+          for (const node of mutation.addedNodes || []) {
+            if (node && node.nodeType === 1) {
+              scheduleScan();
+              return;
+            }
+          }
+        }
+      });
+      observer.observe(document.documentElement, { childList: true, subtree: true });
+    };
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", start, { once: true });
+    } else {
+      start();
+    }
+  }
+
   function isSidebarInlineActionButton(button) {
     const label = elementTextLabel(button);
     return /^(归档对话|置顶对话|全部收起|筛选侧边栏对话|添加新项目)$/.test(label) ||
@@ -433,6 +670,7 @@
   }
 
   installMobileSidebarAutoCollapse();
+  installGatewayAuthMenuInjection();
 
   /** 模型列表请求参数归一化，保证缓存 key 稳定。 */
   function normalizeModelListParams(params) {

@@ -252,7 +252,13 @@ function authCookieHeader(token, expiresAtMs, persistent = PERSIST_AUTH_TOKEN) {
 }
 
 function clearAuthCookieHeader() {
-  return `${COOKIE_NAME}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0`;
+  const expired = "Thu, 01 Jan 1970 00:00:00 GMT";
+  return [
+    `${COOKIE_NAME}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0; Expires=${expired}`,
+    `${COOKIE_NAME}=; Path=/; SameSite=Lax; Max-Age=0; Expires=${expired}`,
+    `${COOKIE_NAME}=; HttpOnly; Path=/api/auth; SameSite=Lax; Max-Age=0; Expires=${expired}`,
+    `${COOKIE_NAME}=; Path=/api/auth; SameSite=Lax; Max-Age=0; Expires=${expired}`,
+  ];
 }
 
 function authRefreshHeaders(auth) {
