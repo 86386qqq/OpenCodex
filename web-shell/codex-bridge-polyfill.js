@@ -7,8 +7,6 @@
       gatewayBaseUrl: location.origin,
       gatewayWsUrl: location.origin.replace(/^http/, "ws") + "/ws",
     });
-  const AUTH_TOKEN_STORAGE_KEY = "codex_web_auth_token";
-  const AUTH_EXPIRES_STORAGE_KEY = "codex_web_auth_expires_at";
   const AUTH_FORCE_LOGIN_STORAGE_KEY = "codex_web_force_login";
   const OPENCODEX_SETTINGS_STORAGE_KEY = "opencodex_web_settings_v1";
   const GATEWAY_AUTH_LOGOUT_LABEL = "退出认证";
@@ -43,35 +41,8 @@
     return opencodexSettings()[key] !== false;
   }
 
-  function storedGatewayAuthToken() {
-    try {
-      const token = sessionStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || "";
-      sessionStorage.removeItem(AUTH_EXPIRES_STORAGE_KEY);
-      return token;
-    } catch {
-      return "";
-    }
-  }
-
-  function gatewayAuthToken() {
-    return storedGatewayAuthToken();
-  }
-
   function gatewayAuthHeaders(headers) {
-    const result = new Headers(headers || {});
-    const token = gatewayAuthToken();
-    if (token) {
-      if (!result.has("authorization")) result.set("authorization", `Bearer ${token}`);
-      if (!result.has("x-codex-web-token")) result.set("x-codex-web-token", token);
-    }
-    return result;
-  }
-
-  function clearGatewayAuthToken() {
-    try {
-      sessionStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
-      sessionStorage.removeItem(AUTH_EXPIRES_STORAGE_KEY);
-    } catch {}
+    return new Headers(headers || {});
   }
 
   function forceGatewayLoginOnNextBoot() {
@@ -472,7 +443,6 @@
         headers: gatewayAuthHeaders({ accept: "application/json" }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      clearGatewayAuthToken();
       forceGatewayLoginOnNextBoot();
       w.location.replace("/");
     } catch (error) {

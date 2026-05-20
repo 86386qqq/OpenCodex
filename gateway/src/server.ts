@@ -38,11 +38,10 @@ const CODEX_GENERATED_IMAGES_DIR = path.join(CODEX_HOME, "generated_images");
 const CODEX_WEB_PICKED_FILES_DIR = path.join(CODEX_HOME, ".tmp", "web-picked-files");
 const PORT = Number(process.env.PORT || 3737);
 const HOST = process.env.HOST || "0.0.0.0";
-const PASSWORD = process.env.CODEX_WEB_PASSWORD || "";
+const AUTH_CONFIG_PATH = path.join(process.cwd(), "config.yaml");
+const PASSWORD_HASH_PREFIX = "sha256-v1:";
+const AUTH_PASSWORD_HASH = loadAuthPasswordHashFromConfig();
 const COOKIE_NAME = "codex_web_auth";
-const PERSIST_AUTH_TOKEN =
-  process.env.CODEX_WEB_PERSIST_AUTH_TOKEN === "1" ||
-  process.env.CODEX_WEB_PERSIST_AUTH_TOKEN === "true";
 const AUTH_TOKEN_TTL_MS = Math.max(
   1_000,
   Number(process.env.CODEX_WEB_AUTH_TOKEN_TTL_MS || 12 * 60 * 60 * 1000)
@@ -83,6 +82,143 @@ function readText(file) {
 /** fs.existsSync 的语义包装，便于后续替换/统一错误处理。 */
 function exists(file) {
   return fs.existsSync(file);
+}
+
+function sha256Hex(value) {
+  return crypto.createHash("sha256").update(String(value), "utf-8").digest("hex");
+}
+
+function isPrefixedPasswordHash(value) {
+  return new RegExp(`^${PASSWORD_HASH_PREFIX}[a-f0-9]{64}$`, "i").test(String(value || "").trim());
+}
+
+function stripYamlComment(value) {
+  let quote = "";
+  for (let i = 0; i < value.length; i += 1) {
+    const char = value[i];
+    if (quote === '"') {
+      if (char === "\\") {
+        i += 1;
+        continue;
+      }
+      if (char === '"') quote = "";
+      continue;
+    }
+    if (quote === "'") {
+      if (char === "'" && value[i + 1] === "'") {
+        i += 1;
+        continue;
+      }
+      if (char === "'") quote = "";
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === "#" && (i === 0 || /\s/.test(value[i - 1]))) {
+      return value.slice(0, i);
+    }
+  }
+  return value;
+}
+
+function parseYamlStringScalar(rawValue) {
+  const value = stripYamlComment(String(rawValue || "")).trim();
+  if (!value || value === "null" || value === "~") return "";
+  if (value.startsWith('"')) {
+    if (!value.endsWith('"')) throw new Error("[gateway] invalid quoted auth.password in config.yaml");
+    try {
+      return JSON.parse(value);
+    } catch {
+      throw new Error("[gateway] invalid quoted auth.password in config.yaml");
+    }
+  }
+  if (value.startsWith("'")) {
+    if (!value.endsWith("'")) throw new Error("[gateway] invalid quoted auth.password in config.yaml");
+    return value.slice(1, -1).replace(/''/g, "'");
+  }
+  return value;
+}
+
+function leadingIndent(line) {
+  const match = String(line || "").match(/^(\s*)/);
+  return match ? match[1].length : 0;
+}
+
+function findAuthPasswordScalar(rawConfig) {
+  const lines = String(rawConfig || "").split(/\r?\n/);
+  let inAuth = false;
+  let authIndent = 0;
+  let authChildIndent = null;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const logicalLine = stripYamlComment(line);
+    if (!logicalLine.trim()) continue;
+    const indent = leadingIndent(line);
+    if (inAuth && indent <= authIndent) {
+      inAuth = false;
+      authChildIndent = null;
+    }
+    if (!inAuth && indent === 0) {
+      const authMatch = logicalLine.trim().match(/^auth\s*:\s*(.*)$/);
+      if (authMatch) {
+        if (authMatch[1].trim()) {
+          throw new Error("[gateway] unsupported inline auth config in config.yaml; use block form auth.password");
+        }
+        inAuth = true;
+        authIndent = indent;
+        authChildIndent = null;
+        continue;
+      }
+    }
+    if (!inAuth || indent <= authIndent) continue;
+    if (authChildIndent == null) authChildIndent = indent;
+    if (indent !== authChildIndent) continue;
+    const passwordMatch = line.match(/^(\s*)password\s*:\s*(.*)$/);
+    if (!passwordMatch) continue;
+    return {
+      lineIndex: i,
+      value: parseYamlStringScalar(passwordMatch[2]),
+    };
+  }
+  return null;
+}
+
+function rewriteAuthPasswordHash(rawConfig, lineIndex, passwordHash) {
+  const hasFinalNewline = /\r?\n$/.test(rawConfig);
+  const normalizedConfig = hasFinalNewline ? String(rawConfig || "").replace(/\r?\n$/, "") : String(rawConfig || "");
+  const lines = normalizedConfig.split(/\r?\n/);
+  const line = lines[lineIndex] || "";
+  const match = line.match(/^(\s*password\s*:\s*).*/);
+  if (!match) throw new Error("[gateway] auth.password line was not found while rewriting config.yaml");
+  lines[lineIndex] = `${match[1]}"${PASSWORD_HASH_PREFIX}${passwordHash}"`;
+  return lines.join("\n") + (hasFinalNewline ? "\n" : "");
+}
+
+function loadAuthPasswordHashFromConfig() {
+  if (!exists(AUTH_CONFIG_PATH)) return "";
+  let rawConfig = "";
+  try {
+    rawConfig = readText(AUTH_CONFIG_PATH);
+  } catch (error) {
+    throw new Error(`[gateway] failed to read config.yaml: ${error.message || error}`);
+  }
+  const authPassword = findAuthPasswordScalar(rawConfig);
+  if (!authPassword || String(authPassword.value || "").length === 0) return "";
+  const passwordValue = String(authPassword.value);
+  const trimmedPasswordValue = passwordValue.trim();
+  if (isPrefixedPasswordHash(trimmedPasswordValue)) {
+    return trimmedPasswordValue.slice(PASSWORD_HASH_PREFIX.length).toLowerCase();
+  }
+  const passwordHash = sha256Hex(passwordValue);
+  const nextConfig = rewriteAuthPasswordHash(rawConfig, authPassword.lineIndex, passwordHash);
+  try {
+    fs.writeFileSync(AUTH_CONFIG_PATH, nextConfig, "utf-8");
+  } catch (error) {
+    throw new Error(`[gateway] failed to rewrite config.yaml auth.password as hash: ${error.message || error}`);
+  }
+  return passwordHash;
 }
 
 /** 安全解析真实路径；失败返回 null，避免路径检查阶段抛异常。 */
@@ -230,7 +366,7 @@ function authTokenFromRequest(req, url = null) {
 
 /** 判断当前 HTTP 请求是否已通过 gateway 访问鉴权。 */
 function authResultForRequest(req, url = null) {
-  if (!PASSWORD) return { authRequired: false, authenticated: true, token: "", expiresAtMs: null };
+  if (!AUTH_PASSWORD_HASH) return { authRequired: false, authenticated: true, token: "", expiresAtMs: null };
   const token = authTokenFromRequest(req, url);
   const entry = authStore.validate(token);
   return {
@@ -245,10 +381,8 @@ function isAuthed(req, url = null) {
   return authResultForRequest(req, url).authenticated;
 }
 
-function authCookieHeader(token, expiresAtMs, persistent = PERSIST_AUTH_TOKEN) {
-  const maxAge = Math.max(0, Math.floor((expiresAtMs - Date.now()) / 1000));
-  const maxAgePart = persistent ? `; Max-Age=${maxAge}` : "";
-  return `${COOKIE_NAME}=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Lax${maxAgePart}`;
+function authCookieHeader(token) {
+  return `${COOKIE_NAME}=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Lax`;
 }
 
 function clearAuthCookieHeader() {
@@ -458,24 +592,28 @@ function staticFile(reqPath) {
   return null;
 }
 
-function readPasswordFromBody(rawBody, contentType) {
+function isValidPasswordHash(value) {
+  return /^[a-f0-9]{64}$/i.test(String(value || "").trim());
+}
+
+function readPasswordHashFromBody(rawBody, contentType) {
   if (String(contentType || "").includes("application/json")) {
     try {
       const parsed = JSON.parse(rawBody || "{}");
-      return typeof parsed.password === "string" ? parsed.password : "";
+      return typeof parsed.passwordHash === "string" ? parsed.passwordHash : "";
     } catch {
       return "";
     }
   }
   const params = new URLSearchParams(rawBody || "");
-  return params.get("password") || "";
+  return params.get("passwordHash") || "";
 }
 
 async function handleAuthLogin(req, res) {
   if (req.method !== "POST") {
     return sendJson(res, 405, { ok: false, error: "Method Not Allowed" }, { "cache-control": "no-store" });
   }
-  if (!PASSWORD) {
+  if (!AUTH_PASSWORD_HASH) {
     return sendJson(
       res,
       200,
@@ -486,14 +624,13 @@ async function handleAuthLogin(req, res) {
         token: "",
         expiresAtMs: null,
         ttlMs: null,
-        persistAuthToken: PERSIST_AUTH_TOKEN,
       },
       { "cache-control": "no-store" }
     );
   }
   const rawBody = await readBody(req);
-  const password = readPasswordFromBody(rawBody, headerValue(req.headers, "content-type"));
-  if (!timingSafeEqualString(password, PASSWORD)) {
+  const passwordHash = readPasswordHashFromBody(rawBody, headerValue(req.headers, "content-type")).trim().toLowerCase();
+  if (!isValidPasswordHash(passwordHash) || !timingSafeEqualString(passwordHash, AUTH_PASSWORD_HASH)) {
     return sendJson(
       res,
       401,
@@ -512,7 +649,6 @@ async function handleAuthLogin(req, res) {
       token: issued.token,
       expiresAtMs: issued.expiresAtMs,
       ttlMs: AUTH_TOKEN_TTL_MS,
-      persistAuthToken: PERSIST_AUTH_TOKEN,
     },
     {
       "cache-control": "no-store",
@@ -528,11 +664,10 @@ function handleAuthStatus(req, res, url) {
     200,
     {
       ok: true,
-      authRequired: !!PASSWORD,
+      authRequired: !!AUTH_PASSWORD_HASH,
       authenticated: auth.authenticated,
       expiresAtMs: auth.expiresAtMs,
-      ttlMs: PASSWORD ? AUTH_TOKEN_TTL_MS : null,
-      persistAuthToken: PERSIST_AUTH_TOKEN,
+      ttlMs: AUTH_PASSWORD_HASH ? AUTH_TOKEN_TTL_MS : null,
     },
     { "cache-control": "no-store", ...authRefreshHeaders(auth) }
   );
@@ -919,8 +1054,8 @@ async function createGateway() {
       return serveWebShellIndex(res);
     }
 
-    const requestAuthForRefresh = PASSWORD ? authResultForRequest(req, url) : null;
-    if (PASSWORD && !requestAuthForRefresh.authenticated) return sendUnauthorized(req, res);
+    const requestAuthForRefresh = AUTH_PASSWORD_HASH ? authResultForRequest(req, url) : null;
+    if (AUTH_PASSWORD_HASH && !requestAuthForRefresh.authenticated) return sendUnauthorized(req, res);
     const requestAuthRefreshHeaders = authRefreshHeaders(requestAuthForRefresh);
     for (const [name, value] of Object.entries(requestAuthRefreshHeaders)) {
       res.setHeader(name, value);
@@ -939,11 +1074,9 @@ async function createGateway() {
           ...requestAuthRefreshHeaders,
         },
         `(() => {
-  const persistAuthToken = ${JSON.stringify(PERSIST_AUTH_TOKEN)};
   window.__CODEX_WEB_CONFIG__ = {
     gatewayBaseUrl: location.origin,
     gatewayWsUrl: location.origin.replace(/^http/, "ws") + "/ws",
-    persistAuthToken,
     workspaceRoots: ${JSON.stringify(gatewayConfig.workspaceRoots)},
     homeDir: ${JSON.stringify(gatewayConfig.homeDir)},
     appServer: ${JSON.stringify(appServer.getMode())},

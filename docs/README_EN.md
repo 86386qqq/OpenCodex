@@ -106,8 +106,18 @@ pnpm run build:gateway
 
 Start the service:
 
+To enable an access password, create `config.yaml` in the current working directory first:
+
+```yaml
+auth:
+  password: "your-password"
+```
+
+On the first startup, the gateway rewrites this field to `sha256-v1:<hash>` so the plaintext password is not kept in the config file. If `config.yaml` is missing, `auth.password` is missing, or the field is empty, password authentication stays disabled.
+Only the block-style YAML form shown above is supported; inline forms such as `auth: { password: "..." }` are rejected.
+
 ```bash
-HOST=0.0.0.0 PORT=3737 CODEX_WEB_PASSWORD=your-password pnpm run web:dev
+HOST=0.0.0.0 PORT=3737 pnpm run web:dev
 ```
 
 Health check:
@@ -126,7 +136,6 @@ Use Tailscale, ZeroTier, a company VPN, or a similar private network solution fo
 | --- | --- | --- |
 | `HOST` | `0.0.0.0` | Gateway bind address. The default is intended for remote access. |
 | `PORT` | `3737` | Gateway port. |
-| `CODEX_WEB_PASSWORD` | empty | **Strongly recommended. Enables gateway password protection; remote access is not secure without it.** |
 | `CODEX_WEB_AUTH_TOKEN_TTL_MS` | `43200000` | Gateway access token lifetime. The default is 12 hours. |
 | `CODEX_WEB_DEBUG` | empty | Set to `1` or `true` for verbose debug logs. |
 | `CODEX_WEB_SLOW_LOG_MS` | `750` | IPC slow-call logging threshold. |

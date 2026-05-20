@@ -110,8 +110,18 @@ pnpm run build:gateway
 
 启动服务：
 
+如需启用访问密码，先在当前目录创建 `config.yaml`：
+
+```yaml
+auth:
+  password: "你的密码"
+```
+
+首次启动后，gateway 会自动把该字段改写为 `sha256-v1:<hash>`，避免明文密码留在配置文件里。没有 `config.yaml`、没有 `auth.password` 或字段为空时，不启用访问密码认证。
+目前只支持上面的块状 YAML 写法，不支持 `auth: { password: "..." }` 这类 inline 写法。
+
 ```bash
-HOST=0.0.0.0 PORT=3737 CODEX_WEB_PASSWORD=你的密码 pnpm run web:dev
+HOST=0.0.0.0 PORT=3737 pnpm run web:dev
 ```
 
 健康检查：
@@ -131,7 +141,6 @@ curl http://127.0.0.1:3737/api/health
 | --- | --- | --- |
 | `HOST` | `0.0.0.0` | gateway 监听地址，默认面向远程访问。 |
 | `PORT` | `3737` | gateway 监听端口。 |
-| `CODEX_WEB_PASSWORD` | 空 | **强烈建议设置；设置后会启用 gateway 访问密码，否则远程访问时安全无法保证。** |
 | `CODEX_WEB_AUTH_TOKEN_TTL_MS` | `43200000` | gateway 访问 token 有效期，默认 12 小时。 |
 | `CODEX_WEB_DEBUG` | 空 | 设为 `1` 或 `true` 后输出更多调试日志。 |
 | `CODEX_WEB_SLOW_LOG_MS` | `750` | IPC 慢调用日志阈值。 |

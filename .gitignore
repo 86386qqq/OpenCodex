@@ -37,6 +37,7 @@ Thumbs.db
 .env
 .env.local
 .env.*.local
+config.yaml
 
 # Temporary files
 *.tmp
