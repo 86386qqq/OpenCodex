@@ -1,12 +1,16 @@
 // @ts-nocheck
 export {};
 
+const fs = require("fs");
+const path = require("path");
+
 let nodePty = null;
 try {
   nodePty = require("node-pty");
 } catch {}
 
 const TERMINAL_REPLAY_BUFFER_LIMIT = 128 * 1024;
+const TERMINAL_SNAPSHOT_BUFFER_LIMIT = 16 * 1024;
 const TERMINAL_IDLE_CLEANUP_MS = Math.max(
   1_000,
   Number(process.env.CODEX_WEB_TERMINAL_IDLE_CLEANUP_MS || 30 * 60 * 1000)
@@ -16,8 +20,80 @@ const TERMINAL_IDLE_SWEEP_MS = Math.max(
   Number(process.env.CODEX_WEB_TERMINAL_IDLE_SWEEP_MS || Math.min(60 * 1000, TERMINAL_IDLE_CLEANUP_MS))
 );
 
+function chmodExecutableIfPresent(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return false;
+    if ((stat.mode & 0o111) !== 0o111) {
+      fs.chmodSync(filePath, stat.mode | 0o755);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 列出 node-pty 可能使用的 Unix spawn-helper；pnpm/预编译/源码构建路径都要覆盖。 */
+function listNodePtySpawnHelperPaths(nodePtyRoot) {
+  const helperPaths = [
+    path.join(nodePtyRoot, "build", "Release", "spawn-helper"),
+    path.join(nodePtyRoot, "build", "Debug", "spawn-helper"),
+    path.join(nodePtyRoot, "prebuilds", `${process.platform}-${process.arch}`, "spawn-helper"),
+  ];
+  const prebuildsDir = path.join(nodePtyRoot, "prebuilds");
+  try {
+    for (const entry of fs.readdirSync(prebuildsDir, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        helperPaths.push(path.join(prebuildsDir, entry.name, "spawn-helper"));
+      }
+    }
+  } catch {}
+  return [...new Set(helperPaths)];
+}
+
+/** Unix 平台需要 spawn-helper 有执行位；部分包管理/解压流程会把它还原成 0644。 */
+function ensureNodePtySpawnHelperExecutable(logger) {
+  if (process.platform === "win32") return;
+  let nodePtyRoot = null;
+  try {
+    nodePtyRoot = path.resolve(path.dirname(require.resolve("node-pty")), "..");
+  } catch {
+    return;
+  }
+  let fixed = false;
+  for (const helperPath of listNodePtySpawnHelperPaths(nodePtyRoot)) {
+    fixed = chmodExecutableIfPresent(helperPath) || fixed;
+  }
+  if (fixed && logger && typeof logger.info === "function") {
+    logger.info("[terminal] ensured node-pty spawn-helper is executable");
+  }
+}
+
+/** 兼容 renderer 直接传 params 或 fetchFromHost 包一层 params 的两种 payload。 */
+function paramsFromPayload(payload) {
+  return payload && typeof payload === "object" && payload.params && typeof payload.params === "object"
+    ? payload.params
+    : payload;
+}
+
+/** 官方不同入口会用 conversationId/threadId/sessionId 指代同一个 thread 维度。 */
+function conversationIdFromPayload(payload) {
+  const params = paramsFromPayload(payload);
+  if (!params || typeof params !== "object") return "";
+  const value = params.conversationId || params.threadId || params.sessionId || "";
+  return typeof value === "string" ? value : "";
+}
+
+/** terminal title 不能带控制字符，否则会污染 tab 标题和快照。 */
+function cleanTerminalTitle(value) {
+  return typeof value === "string" ? value.replace(/[\u0000-\u001F\u007F]/g, "").trim() : null;
+}
+
 function createTerminalIpcHandlers(deps) {
   const terminalSessions = new Map();
+  const conversationSessions = new Map();
+  ensureNodePtySpawnHelperExecutable(deps.logger);
+
   /** 终端事件广播给 web-shell，最终由 renderer 的终端组件消费。 */
   function broadcastTerminal(channel, payload) {
     if (typeof deps.broadcast === "function") {
@@ -46,6 +122,18 @@ function createTerminalIpcHandlers(deps) {
     if (clientId) session.clientIds.add(clientId);
   }
 
+  function rememberConversationSession(sessionId, conversationId) {
+    if (!sessionId || !conversationId) return;
+    conversationSessions.set(String(conversationId), sessionId);
+  }
+
+  function forgetConversationSession(sessionId) {
+    if (!sessionId) return;
+    for (const [conversationId, mappedSessionId] of conversationSessions) {
+      if (mappedSessionId === sessionId) conversationSessions.delete(conversationId);
+    }
+  }
+
   /** 判断终端会话是否仍有任何在线浏览器在使用。 */
   function terminalSessionHasConnectedClient(session) {
     if (!session || !session.clientIds || session.clientIds.size === 0) return false;
@@ -63,6 +151,7 @@ function createTerminalIpcHandlers(deps) {
       if (terminalSessionHasConnectedClient(session)) continue;
       if (now - session.lastActivityMs < TERMINAL_IDLE_CLEANUP_MS) continue;
       terminalSessions.delete(sessionId);
+      forgetConversationSession(sessionId);
       try {
         session.ptyProcess.kill();
       } catch {}
@@ -92,6 +181,7 @@ function createTerminalIpcHandlers(deps) {
     const existing = terminalSessions.get(payload.sessionId);
     if (existing) {
       touchTerminalSession(existing, context);
+      rememberConversationSession(payload.sessionId, conversationIdFromPayload(payload));
       const cols = Number.isFinite(Number(payload.cols)) ? Math.max(2, Number(payload.cols)) : null;
       const rows = Number.isFinite(Number(payload.rows)) ? Math.max(2, Number(payload.rows)) : null;
       if (cols && rows) {
@@ -142,12 +232,16 @@ function createTerminalIpcHandlers(deps) {
       ptyProcess,
       cwd,
       shell,
+      title: null,
+      rawShellTitle: null,
       outputBuffer: "",
+      outputTruncated: false,
       lastActivityMs: Date.now(),
       clientIds: new Set(),
     };
     touchTerminalSession(session, context);
     terminalSessions.set(payload.sessionId, session);
+    rememberConversationSession(payload.sessionId, conversationIdFromPayload(payload));
     broadcastTerminal("terminal-attached", {
       sessionId: payload.sessionId,
       cwd,
@@ -158,11 +252,13 @@ function createTerminalIpcHandlers(deps) {
       session.outputBuffer += data;
       if (session.outputBuffer.length > TERMINAL_REPLAY_BUFFER_LIMIT) {
         session.outputBuffer = session.outputBuffer.slice(-TERMINAL_REPLAY_BUFFER_LIMIT);
+        session.outputTruncated = true;
       }
       broadcastTerminal("terminal-data", { sessionId: payload.sessionId, data });
     });
     ptyProcess.onExit(({ exitCode, signal }) => {
       terminalSessions.delete(payload.sessionId);
+      forgetConversationSession(payload.sessionId);
       broadcastTerminal("terminal-exit", {
         sessionId: payload.sessionId,
         code: exitCode,
@@ -177,10 +273,39 @@ function createTerminalIpcHandlers(deps) {
     const session = terminalSessions.get(sessionId);
     if (!session) return true;
     terminalSessions.delete(sessionId);
+    forgetConversationSession(sessionId);
     try {
       session.ptyProcess.kill();
     } catch {}
     return true;
+  }
+
+  /** 返回官方 renderer 读取 app terminal 时需要的轻量快照。 */
+  function terminalSnapshotForSession(session) {
+    if (!session) return null;
+    const buffer = String(session.outputBuffer || "");
+    return {
+      cwd: session.cwd || "",
+      shell: session.shell || "unknown",
+      title: session.title || null,
+      rawShellTitle: session.rawShellTitle || null,
+      buffer: buffer.slice(-TERMINAL_SNAPSHOT_BUFFER_LIMIT),
+      truncated: !!session.outputTruncated || buffer.length > TERMINAL_SNAPSHOT_BUFFER_LIMIT,
+    };
+  }
+
+  /** 按 thread/conversation 找到当前活跃终端，并返回其输出缓冲。 */
+  function threadTerminalSnapshot(payload) {
+    const conversationId = conversationIdFromPayload(payload);
+    const sessionId = conversationId ? conversationSessions.get(conversationId) : null;
+    return {
+      session: sessionId ? terminalSnapshotForSession(terminalSessions.get(sessionId)) : null,
+    };
+  }
+
+  /** OpenCodex 目前没有单独的 node_repl 后台执行表；返回 0 让官方中断流程继续。 */
+  function killNodeReplActiveExecs() {
+    return { failedCount: 0 };
   }
 
   /** 处理 terminal-* 消息，包括 create/write/resize/close/run-action。 */
@@ -209,6 +334,10 @@ function createTerminalIpcHandlers(deps) {
           typeof payload.cwd === "string" && payload.cwd && deps.isWithinAllowedRoots(payload.cwd)
             ? deps.normalizeWorkspacePath(payload.cwd)
             : null;
+        if (cwd) session.cwd = cwd;
+        const title = cleanTerminalTitle(command);
+        session.title = title || session.title || null;
+        session.rawShellTitle = null;
         session.ptyProcess.write(`${cwd ? `cd ${deps.shellQuote(cwd)} && ` : ""}${command}\r`);
         return true;
       }
@@ -233,6 +362,8 @@ function createTerminalIpcHandlers(deps) {
 
   return {
     handleTerminalMessage,
+    killNodeReplActiveExecs,
+    threadTerminalSnapshot,
   };
 }
 

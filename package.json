@@ -6,6 +6,7 @@
   "description": "Standalone OpenCodex package for the bundled desktop app, web gateway, and vendor code",
   "private": true,
   "scripts": {
+    "postinstall": "node scripts/fix-node-pty-spawn-helper.cjs",
     "web:dev": "node gateway/dist/server.js",
     "build:gateway": "tsc -p gateway/tsconfig.json",
     "build:vendor": "pnpm --dir vendor/electron-to-web run build",

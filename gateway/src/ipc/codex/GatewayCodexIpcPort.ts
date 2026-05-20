@@ -780,6 +780,10 @@ function makeHandlers({ appServer, broadcast, logger, isClientConnected }) {
       case "start-windows-sandbox-setup-for-host":
       case "update-thread-git-branch":
         return true;
+      case "thread-terminal-snapshot":
+        return terminalIpc.threadTerminalSnapshot(payload);
+      case "node-repl-active-execs-kill":
+        return terminalIpc.killNodeReplActiveExecs(payload);
       case "turn:start":
         return appServerBridge.callAppServer("turn/start", payload);
       case "turn:interrupt":
