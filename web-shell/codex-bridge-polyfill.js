@@ -7,6 +7,8 @@
       gatewayBaseUrl: location.origin,
       gatewayWsUrl: location.origin.replace(/^http/, "ws") + "/ws",
     });
+  const OPENCODEX_LOCALE = cfg.locale || "zh-CN";
+  const OPENCODEX_LANGUAGES = [OPENCODEX_LOCALE, "zh-CN", "zh", "en-US", "en"];
   const AUTH_FORCE_LOGIN_STORAGE_KEY = "codex_web_force_login";
   const OPENCODEX_SETTINGS_STORAGE_KEY = "opencodex_web_settings_v1";
   const GATEWAY_AUTH_LOGOUT_LABEL = "退出认证";
@@ -30,6 +32,24 @@
   const SIDEBAR_TOGGLE_VIEW_TRANSITION_NAME = "sidebar-trigger";
   const SIDEBAR_NEW_CONVERSATION_ICON_PATH_PREFIX = "M2.6687 11.333";
   const NEW_CONVERSATION_MESSAGE_TYPES = new Set(["new-chat", "new-quick-chat"]);
+
+  function installLocaleOverride() {
+    try {
+      document.documentElement.lang = OPENCODEX_LOCALE;
+    } catch {}
+    try {
+      Object.defineProperty(navigator, "language", {
+        configurable: true,
+        get: () => OPENCODEX_LOCALE,
+      });
+    } catch {}
+    try {
+      Object.defineProperty(navigator, "languages", {
+        configurable: true,
+        get: () => OPENCODEX_LANGUAGES,
+      });
+    } catch {}
+  }
 
   function opencodexSettings() {
     try {
@@ -105,7 +125,127 @@
     }
   }
 
+  installLocaleOverride();
   installRandomUUIDPolyfill();
+
+  function installMobileViewportGuards() {
+    if (!document || document.__codexMobileViewportGuardsInstalled) return;
+    document.__codexMobileViewportGuardsInstalled = true;
+
+    const style = document.createElement("style");
+    style.id = "codex-mobile-viewport-guards";
+    style.textContent = `
+      @media (max-width: 820px), (pointer: coarse) {
+        html,
+        body,
+        #root {
+          height: var(--codex-visual-viewport-height, 100dvh) !important;
+          min-height: var(--codex-visual-viewport-height, 100dvh) !important;
+          max-height: var(--codex-visual-viewport-height, 100dvh) !important;
+          overflow: hidden;
+        }
+
+        body {
+          width: 100%;
+          touch-action: pan-x pan-y;
+          overscroll-behavior: none;
+        }
+
+        input,
+        textarea,
+        [contenteditable="true"],
+        .ProseMirror {
+          font-size: max(16px, 1em) !important;
+          scroll-margin-bottom: calc(var(--codex-keyboard-inset-bottom, 0px) + 96px);
+        }
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+
+    const setViewportVars = () => {
+      const viewport = w.visualViewport;
+      const height = Math.max(0, Math.floor(viewport?.height || w.innerHeight || document.documentElement.clientHeight || 0));
+      const offsetTop = Math.max(0, Math.floor(viewport?.offsetTop || 0));
+      const layoutHeight = Math.max(0, Math.floor(w.innerHeight || document.documentElement.clientHeight || height));
+      const keyboardInset = Math.max(0, layoutHeight - height - offsetTop);
+      const root = document.documentElement;
+      if (height > 0) root.style.setProperty("--codex-visual-viewport-height", `${height}px`);
+      root.style.setProperty("--codex-visual-viewport-offset-top", `${offsetTop}px`);
+      root.style.setProperty("--codex-keyboard-inset-bottom", `${keyboardInset}px`);
+    };
+
+    const scrollableAncestor = (element) => {
+      for (let node = element?.parentElement; node && node !== document.body; node = node.parentElement) {
+        const style = w.getComputedStyle ? w.getComputedStyle(node) : null;
+        const overflowY = String(style?.overflowY || "");
+        if (/(auto|scroll)/.test(overflowY) && node.scrollHeight > node.clientHeight) return node;
+      }
+      return null;
+    };
+
+    const keepActiveInputVisible = () => {
+      if (!isLikelyMobileKeyboardDevice()) return;
+      const active = document.activeElement;
+      if (!isComposerEditableElement(active)) return;
+      const viewport = w.visualViewport;
+      const visibleTop = Math.max(0, viewport?.offsetTop || 0);
+      const visibleBottom = visibleTop + Math.max(0, viewport?.height || w.innerHeight || 0);
+      if (visibleBottom <= visibleTop) return;
+
+      const rect = active.getBoundingClientRect();
+      const bottomLimit = visibleBottom - 18;
+      const topLimit = visibleTop + 8;
+      let delta = 0;
+      if (rect.bottom > bottomLimit) {
+        delta = rect.bottom - bottomLimit;
+      } else if (rect.top < topLimit) {
+        delta = rect.top - topLimit;
+      }
+      if (Math.abs(delta) < 1) return;
+
+      const scroller = scrollableAncestor(active);
+      if (scroller) {
+        scroller.scrollTop += delta;
+        return;
+      }
+      try {
+        w.scrollBy(0, delta);
+      } catch {}
+    };
+
+    const scheduleViewportUpdate = () => {
+      setViewportVars();
+      const run = () => {
+        setViewportVars();
+        keepActiveInputVisible();
+      };
+      if (typeof w.requestAnimationFrame === "function") {
+        w.requestAnimationFrame(run);
+      } else {
+        w.setTimeout(run, 0);
+      }
+      w.setTimeout(run, 80);
+      w.setTimeout(run, 240);
+    };
+    const preventZoomGesture = (event) => {
+      if (!isLikelyMobileKeyboardDevice()) return;
+      if (event.touches && event.touches.length < 2) return;
+      event.preventDefault();
+    };
+
+    setViewportVars();
+    w.addEventListener("resize", scheduleViewportUpdate, { passive: true });
+    w.addEventListener("orientationchange", scheduleViewportUpdate, { passive: true });
+    w.visualViewport?.addEventListener("resize", scheduleViewportUpdate, { passive: true });
+    w.visualViewport?.addEventListener("scroll", scheduleViewportUpdate, { passive: true });
+    document.addEventListener("focusin", scheduleViewportUpdate, true);
+    document.addEventListener("input", scheduleViewportUpdate, true);
+    document.addEventListener("touchmove", preventZoomGesture, { passive: false });
+    document.addEventListener("gesturestart", preventZoomGesture, { passive: false });
+    document.addEventListener("gesturechange", preventZoomGesture, { passive: false });
+  }
+
+  installMobileViewportGuards();
 
   /**
    * Electron 的 <webview> 在浏览器里不存在。
@@ -255,6 +395,11 @@
   const MOBILE_COMPOSER_MANUAL_FOCUS_MS = 900;
   const MOBILE_SIDEBAR_AUTO_COLLAPSE_DELAY_MS = 80;
   const STATSIG_DEFAULT_FEATURES_CONFIG = "statsig_default_enable_features";
+  const STATSIG_I18N_LAYER_CONFIG = "72216192";
+  const STATSIG_I18N_LAYER_VALUES = {
+    enable_i18n: true,
+    locale_source: "IDE",
+  };
   const STATSIG_DEFAULT_FEATURE_OVERRIDES = {
     guardian_approval: true,
     "3903742690": true,
@@ -1450,7 +1595,7 @@
     const method = String(payload.method || "GET").toUpperCase();
     const url = String(payload.url || "");
     if (method === "GET") return true;
-    return /^vscode:\/\/codex\/(paths-exist|git-origins|ide-context|get-global-state|set-global-state|get-configuration|set-configuration|set-remote-control-connections-enabled)$/i.test(url);
+    return /^vscode:\/\/codex\/(paths-exist|git-origins|ide-context|get-global-state|set-global-state|get-configuration|set-configuration|get-settings|get-setting|set-setting|set-remote-control-connections-enabled)$/i.test(url);
   }
 
   /** 只对首屏/切换会话所需的安全 IPC 做短重试，避免第一次点击被 transient fetch 失败卡死。 */
@@ -1877,6 +2022,64 @@
   };
   w.codexWindowType = w.codexWindowType || "electron";
 
+  /** 浏览器直连 Statsig/遥测在受限网络下会刷 console error；Web 侧用本地默认值兜底。 */
+  function buildStatsigInitializeResponse() {
+    const feature_gates = {};
+    const dynamic_configs = {
+      [STATSIG_DEFAULT_FEATURES_CONFIG]: {
+        name: STATSIG_DEFAULT_FEATURES_CONFIG,
+        value: { ...STATSIG_DEFAULT_FEATURE_OVERRIDES },
+        rule_id: "gateway_override",
+        secondary_exposures: [],
+      },
+    };
+    for (const [name, value] of Object.entries(STATSIG_DEFAULT_FEATURE_OVERRIDES)) {
+      feature_gates[name] = {
+        name,
+        value,
+        rule_id: "gateway_override",
+        secondary_exposures: [],
+      };
+    }
+    return {
+      has_updates: true,
+      time: Date.now(),
+      hash_used: "djb2",
+      feature_gates,
+      dynamic_configs,
+      layer_configs: {
+        [STATSIG_I18N_LAYER_CONFIG]: {
+          name: STATSIG_I18N_LAYER_CONFIG,
+          value: { ...STATSIG_I18N_LAYER_VALUES },
+          rule_id: "gateway_override",
+          secondary_exposures: [],
+        },
+      },
+      param_stores: {},
+      exposures: {},
+      sdk_flags: {},
+    };
+  }
+
+  function isStatsigInitializeUrl(url) {
+    try {
+      const parsed = new URL(url, location.href);
+      return parsed.hostname === "ab.chatgpt.com" && parsed.pathname.replace(/\/+$/, "") === "/v1/initialize";
+    } catch {
+      return false;
+    }
+  }
+
+  function isTelemetryRegisterUrl(url) {
+    try {
+      const parsed = new URL(url, location.href);
+      const pathname = parsed.pathname.replace(/\/+$/, "");
+      return parsed.hostname === "chatgpt.com" && (pathname === "/ces/v1/rgstr" || pathname === "/ces/v1/log_event");
+    } catch {
+      return false;
+    }
+  }
+
   // sentry-ipc:// 是 Electron 私有协议，浏览器里用空响应兜底，避免 renderer 报错。
   if (typeof w.fetch === "function" && !w.__codexWebFetchPatched) {
     const originalFetch = w.fetch.bind(w);
@@ -1891,6 +2094,18 @@
         return new Response("{}", {
           status: 200,
           headers: { "content-type": "application/json" },
+        });
+      }
+      if (isStatsigInitializeUrl(url)) {
+        return new Response(JSON.stringify(buildStatsigInitializeResponse()), {
+          status: 200,
+          headers: { "content-type": "application/json; charset=utf-8" },
+        });
+      }
+      if (isTelemetryRegisterUrl(url)) {
+        return new Response("{}", {
+          status: 200,
+          headers: { "content-type": "application/json; charset=utf-8" },
         });
       }
       return originalFetch(input, init);
