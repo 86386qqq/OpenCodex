@@ -244,6 +244,15 @@ function diagnosePrimaryRuntimeDependencies() {
   };
 }
 
+function buildPrimaryRuntimeInstallResult(status = "already-current") {
+  // 官方安装入口会读取 status/bundleVersion；Web gateway 的内置运行时始终视为已就绪。
+  return {
+    ...buildPrimaryRuntimeDependencies(),
+    phase: "ready",
+    status,
+  };
+}
+
 const diagnostics = createCodexDiagnostics({
   reportsDir: REPORTS_DIR,
   docsDir: DOCS_DIR,
@@ -750,9 +759,12 @@ function makeHandlers({ appServer, broadcast, logger, isClientConnected }) {
         return buildPrimaryRuntimeDependencies();
       case "diagnose-primary-runtime-dependencies":
         return diagnosePrimaryRuntimeDependencies();
+      case "install-primary-runtime":
+      case "finish-primary-runtime-install":
+        return buildPrimaryRuntimeInstallResult("already-current");
       case "primary-runtime-update-run-now":
       case "reset-primary-runtime-dependencies":
-        return { ...diagnosePrimaryRuntimeDependencies(), status: "ready" };
+        return buildPrimaryRuntimeInstallResult("installed");
       case "cancel-primary-runtime-install":
       case "cancel-primary-runtime-dependencies":
         return { canceled: false };
