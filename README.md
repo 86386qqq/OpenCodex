@@ -84,7 +84,8 @@ flowchart TB
 - Node.js 20 或更高版本
 - pnpm
 - 本机已安装 Codex Desktop（推荐），或通过环境变量显式指定 Codex Desktop / official bundle 路径。
-- Mac/Windows系统，目前Mac完全支持，Windows未测试。
+- macOS / Windows。macOS、Windows 均提供 Launcher 构建命令。
+- Windows 打包需要安装 Visual Studio 2022 C++ 构建工具，以及对应架构的 Spectre-mitigated VC++ 库，否则 `node-pty` 原生模块重编译会失败。
 
 依赖安装：
 
@@ -99,9 +100,9 @@ pnpm install
 
 ## 如何使用
 
-### macOS 一键启动包
+### 桌面一键启动包
 
-当前已提供 macOS Launcher 打包入口。它会在启动时自动拉起 gateway，并在窗口里展示：
+当前已提供 Launcher 打包入口。它会在启动时自动拉起 gateway，并在窗口里展示：
 
 - 本机访问地址、gateway 进程和监听端口。
 - 当前使用的 Codex 版本、build、Codex 安装路径、`app.asar` 路径和 CLI 路径。
@@ -121,6 +122,12 @@ pnpm run desktop:dev
 
 ```bash
 pnpm run desktop:dist:mac
+```
+
+生成 Windows 安装产物：
+
+```bash
+pnpm run desktop:dist:win
 ```
 
 产物会输出到 `release/`。Launcher 默认只监听 `127.0.0.1`，首次启动会随机选择一个可用端口，运行时数据放在系统用户数据目录中，不再写入安装目录。修改监听地址、端口或访问密码后，Launcher 会重启 gateway 让配置生效。
@@ -162,15 +169,49 @@ pnpm exec electron-builder --mac --dir --arm64
 
 生成的 `.app` 会在启动时创建用户数据目录，保存 Launcher 设置、访问密码配置、gateway 日志和 official renderer 缓存。
 
+#### 构建 Windows 安装包
+
+从干净仓库构建 Windows 产物：
+
+```powershell
+git clone --recursive xxx
+cd OpenCodex
+pnpm install
+pnpm run build
+pnpm run desktop:dist:win
+```
+
+`desktop:dist:win` 会先编译 `vendor/electron-to-web` 和 `gateway`，再通过 `electron-builder` 生成 x64 NSIS 安装器和 `.zip`。产物位于 `release/`。
+
+调试未压缩 Windows 应用目录：
+
+```powershell
+pnpm run build
+pnpm run desktop:pack:win
+```
+
+### GitHub Actions 自动发布
+
+仓库内置 `.github/workflows/release-desktop.yml`，推送 `release` 或 `release/*` 分支时会自动构建并发布桌面产物：
+
+- Windows 在 `windows-2022` runner 上运行 `pnpm run desktop:dist:win`。
+- macOS 在 `macos-15-intel` runner 上运行 `pnpm run desktop:dist:mac`。
+- 两个平台的产物会合并上传到同一个 GitHub Release。
+
+Release tag 规则：
+
+- 手动触发 workflow 时，如果填写 `tag`，优先使用该值。
+- 推送 `release/v1.0.0` 或 `release/1.0.0` 时，发布到 `v1.0.0`。
+- 推送 `release` 分支时，发布到 `package.json` 中版本号对应的 `v<version>`。
+
+如果发布步骤提示权限不足，需要在仓库 Settings -> Actions -> General 中允许 `GITHUB_TOKEN` 具备 read and write permissions。
+
 ### 命令行启动
 
 先编译
 
 ```bash
-pnpm run build:vendor
-```
-```bash
-pnpm run build:gateway
+pnpm build
 ```
 
 启动服务：
@@ -244,9 +285,11 @@ curl http://127.0.0.1:3737/api/health
 | `pnpm run web:dev` | 启动已编译的 gateway。 |
 | `pnpm run build:vendor` | 编译 `vendor/electron-to-web`。 |
 | `pnpm run test:vendor` | 运行 `vendor/electron-to-web` 测试。 |
-| `pnpm run desktop:dev` | 编译后启动 macOS Launcher 调试。 |
+| `pnpm run desktop:dev` | 编译后启动 Launcher 调试。 |
 | `pnpm run desktop:pack:mac` | 生成未压缩的 macOS `.app`。 |
 | `pnpm run desktop:dist:mac` | 生成 macOS `.dmg` 和 `.zip` 产物。 |
+| `pnpm run desktop:pack:win` | 生成未压缩的 Windows 应用目录。 |
+| `pnpm run desktop:dist:win` | 生成 Windows NSIS 安装器和 `.zip` 产物。 |
 
 ## 排障
 
