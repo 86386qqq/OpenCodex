@@ -1991,7 +1991,12 @@
     };
     target.getSharedObjectSnapshotValue = (key) => getSharedObjectSnapshotValue(key);
     target.showContextMenu = () => true;
-    target.showApplicationMenu = () => true;
+    // 官方 Windows 菜单栏只检查 showApplicationMenu 是否存在；Web shell 不暴露它，避免渲染文件/编辑等菜单项。
+    try {
+      delete target.showApplicationMenu;
+    } catch {
+      target.showApplicationMenu = undefined;
+    }
     target.triggerSentryTestError = () => {
       console.warn("[codex-web] triggerSentryTestError is a no-op in web");
       return false;

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, clipboard, ipcMain, shell } = require("electron");
+const { app, BrowserWindow, Menu, clipboard, ipcMain, shell } = require("electron");
 const crypto = require("crypto");
 const fs = require("fs");
 const net = require("net");
@@ -398,6 +398,8 @@ async function restartGateway() {
 }
 
 function createWindow() {
+  // Windows/Linux 默认会显示 Electron 应用菜单；启动器不需要菜单栏，创建窗口前统一关闭。
+  Menu.setApplicationMenu(null);
   mainWindow = new BrowserWindow({
     width: 980,
     height: 720,
@@ -405,6 +407,7 @@ function createWindow() {
     minHeight: 600,
     title: "OpenCodex",
     backgroundColor: "#f7f6f2",
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -414,6 +417,7 @@ function createWindow() {
   });
 
   mainWindow.loadFile(path.join(__dirname, "index.html"));
+  mainWindow.setMenuBarVisibility(false);
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
