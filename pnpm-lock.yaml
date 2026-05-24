@@ -23,6 +23,9 @@ importers:
       express:
         specifier: ^5.2.1
         version: 5.2.1
+      json-rpc-2.0:
+        specifier: ^1.7.0
+        version: 1.7.1
       node-pty:
         specifier: ^1.1.0
         version: 1.1.0
