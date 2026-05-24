@@ -183,16 +183,74 @@ function writeAuthConfig(paths, password) {
   fs.writeFileSync(paths.configPath, `auth:\n  password: ${JSON.stringify(stored)}\n`, "utf8");
 }
 
+function parseIpv4Parts(address) {
+  const parts = String(address || "")
+    .split(".")
+    .map((part) => Number(part));
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return null;
+  return parts;
+}
+
+function ipv4NetworkScore(address) {
+  const parts = parseIpv4Parts(address);
+  if (!parts) return -1000;
+
+  const [first, second] = parts;
+  if (first === 10 || (first === 172 && second >= 16 && second <= 31) || (first === 192 && second === 168)) {
+    return 500;
+  }
+  if (first === 100 && second >= 64 && second <= 127) return 350;
+  if (first === 169 && second === 254) return 100;
+  return 200;
+}
+
+function interfaceNameScore(name) {
+  const normalizedName = String(name || "").toLowerCase();
+  let score = 0;
+
+  // 局域网访问地址优先选择真实 Wi-Fi / 以太网，避免虚拟网卡抢占展示的主地址。
+  if (/wi-?fi|wlan|ethernet|以太网|无线|本地连接|^en\d|^eth\d/.test(normalizedName)) score += 120;
+  if (/virtual|vmware|vbox|virtualbox|hyper-v|vethernet|wsl|docker|container/.test(normalizedName)) score -= 160;
+  if (/loopback|npcap|tailscale|zerotier|hamachi|wireguard|wintun|vpn|openvpn|utun|tap|tun|ppp/.test(normalizedName)) {
+    score -= 120;
+  }
+  if (/bluetooth|蓝牙/.test(normalizedName)) score -= 80;
+
+  return score;
+}
+
+function lanCandidateScore(candidate) {
+  return ipv4NetworkScore(candidate.address) + interfaceNameScore(candidate.name);
+}
+
 function lanUrlsForPort(port) {
-  const urls = [];
+  const candidates = [];
   const interfaces = os.networkInterfaces();
-  for (const entries of Object.values(interfaces)) {
+  let order = 0;
+  for (const [name, entries] of Object.entries(interfaces)) {
     for (const entry of entries || []) {
-      if (!entry || entry.internal || entry.family !== "IPv4" || !entry.address) continue;
-      urls.push(`http://${entry.address}:${port}`);
+      if (!entry || entry.internal || (entry.family !== "IPv4" && entry.family !== 4) || !entry.address) continue;
+      const parts = parseIpv4Parts(entry.address);
+      if (!parts) continue;
+      const [first] = parts;
+      if (first === 0 || first === 127 || first >= 224) continue;
+      candidates.push({
+        address: entry.address,
+        name,
+        order: order++,
+        url: `http://${entry.address}:${port}`,
+      });
     }
   }
-  return Array.from(new Set(urls));
+  const seen = new Set();
+  return candidates
+    .sort((left, right) => lanCandidateScore(right) - lanCandidateScore(left) || left.order - right.order)
+    .filter((candidate) => {
+      if (seen.has(candidate.url)) return false;
+      seen.add(candidate.url);
+      return true;
+    })
+    .map((candidate) => candidate.url);
 }
 
 function updateGatewayUrls() {
