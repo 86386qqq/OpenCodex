@@ -6,6 +6,7 @@ const path = require("path");
 const http = require("http");
 const os = require("os");
 const crypto = require("crypto");
+const zlib = require("zlib");
 const { AsyncLocalStorage } = require("async_hooks");
 
 if (process.versions && process.versions.electron) {
@@ -275,6 +276,8 @@ function mimeType(file) {
       return "text/css; charset=utf-8";
     case ".json":
       return "application/json; charset=utf-8";
+    case ".wasm":
+      return "application/wasm";
     case ".svg":
       return "image/svg+xml";
     case ".ico":
@@ -434,6 +437,17 @@ function sendJson(res, status, value, extraHeaders = {}) {
   );
 }
 
+function gzipIfUseful(req, headers, body) {
+  if (process.env.CODEX_WEB_DISABLE_GZIP === "1" || !Buffer.isBuffer(body) || body.length < 1024) return { headers, body };
+  if (!String(req.headers["accept-encoding"] || "").includes("gzip")) return { headers, body };
+  const contentType = String(headers["content-type"] || "");
+  if (!/javascript|css|html|json|svg|wasm/i.test(contentType)) return { headers, body };
+  return {
+    headers: { ...headers, "content-encoding": "gzip", vary: "Accept-Encoding" },
+    body: zlib.gzipSync(body),
+  };
+}
+
 /** 兼容 Node 不同 headers 结构的大小写查询。 */
 function headerValue(headers, name) {
   const normalized = String(name).toLowerCase();
@@ -588,6 +602,10 @@ function isAppShellRoute(req, pathname) {
 /** 所有响应期 patch 过的官方 JS 统一从独立路径命名空间加载，避免和官方 immutable 缓存混用。 */
 function shouldPatchOfficialAsset(reqPath) {
   return /^\/official-patched\/assets\/[^/]+\.js$/.test(reqPath);
+}
+
+function hasHashedAssetName(reqPath) {
+  return /\/assets\/.+-[A-Za-z0-9_-]{6,}\.[A-Za-z0-9]+$/.test(reqPath);
 }
 
 /** 恢复历史 turn 时旧 renderer 转换漏了 firstTurnWorkItemStartedAtMs，导致折叠摘要退回“上 x 条消息”。 */
@@ -748,8 +766,9 @@ function sendUnauthorized(req, res) {
 /** 静态资源缓存策略：hash asset 长缓存，入口 HTML/no-store 保持可更新。 */
 function cacheControlForRequestPath(reqPath) {
   if (process.env.CODEX_WEB_DISABLE_ASSET_CACHE === "1") return "no-store";
-  if (shouldPatchOfficialAsset(reqPath)) return "no-store";
-  if (reqPath.startsWith("/official-patched/assets/")) return "public, max-age=31536000, immutable";
+  if (reqPath.startsWith("/official-patched/assets/")) {
+    return hasHashedAssetName(reqPath) ? "public, max-age=31536000, immutable" : "no-store";
+  }
   if (reqPath.startsWith("/official/assets/")) return "public, max-age=31536000, immutable";
   if (reqPath.startsWith(WEB_SHELL_ASSETS_PREFIX)) return "public, max-age=86400";
   if (reqPath.startsWith("/official/")) return "public, max-age=3600";
@@ -757,9 +776,14 @@ function cacheControlForRequestPath(reqPath) {
 }
 
 /** 发送静态文件，并按路径套用合适的缓存策略。 */
-function serveFile(res, file, status = 200, reqPath = "") {
+function serveFile(req, res, file, status = 200, reqPath = "") {
   const data = patchOfficialAsset(reqPath, fs.readFileSync(file));
-  send(res, status, { "content-type": mimeType(file), "cache-control": cacheControlForRequestPath(reqPath) }, data);
+  const response = gzipIfUseful(
+    req,
+    { "content-type": mimeType(file), "cache-control": cacheControlForRequestPath(reqPath) },
+    data
+  );
+  send(res, status, response.headers, response.body);
 }
 
 function serveWebShellIndex(res) {
@@ -1141,7 +1165,7 @@ async function createGateway() {
 
     if (isPublicOfficialAsset(pathname)) {
       const file = staticFile(pathname);
-      if (file && exists(file)) return serveFile(res, file, 200, pathname);
+      if (file && exists(file)) return serveFile(req, res, file, 200, pathname);
     }
 
     if (isAppShellRoute(req, pathname)) {
@@ -1354,7 +1378,7 @@ async function createGateway() {
     }
 
     const file = staticFile(pathname);
-    if (file && exists(file)) return serveFile(res, file, 200, pathname);
+    if (file && exists(file)) return serveFile(req, res, file, 200, pathname);
 
     if (isAppShellRoute(req, pathname)) {
       // 所有无扩展名前端路由都走同一个 bootstrap，让官方 router 接管 /local、/remote 等路径。
