@@ -7,7 +7,7 @@ OpenCodex is a lightweight implementation of a Codex runtime environment. It run
 In one line:
 
 ```text
-browser -> web-shell -> official Codex renderer -> bridge polyfill -> gateway -> Codex app-server / local host capabilities
+browser -> web-shell -> official Codex renderer -> bridge polyfill -> official-gateway -> hidden official Electron runtime
 ```
 
 ---
@@ -34,13 +34,14 @@ OpenCodex still has several advantages compared with the official mobile path:
 
 ## Core Components
 
-The project has three main parts:
+The project has four main parts:
 
 | Module | Purpose |
 | --- | --- |
 | `web-shell/` | Browser entry point for loading the official renderer and providing the renderer runtime environment. |
-| `gateway/` | Local Node gateway that provides HTTP, WebSocket, IPC compatibility, local files, git, terminal, state sync, and app-server forwarding. |
-| `/electron-to-web/` | Electron semantics adapter. The gateway prefers it by default to reuse Electron IPC behavior, with a self-implemented `DirectGatewayElectronIpcPort` as an alternative. |
+| `official-gateway/` | Current runtime entry point. It provides HTTP, WebSocket, auth, and forwards browser IPC into the hidden official Electron runtime. |
+| `gateway/src/official/` | Scanning, identification, caching, and renderer working-copy extraction for the official Codex `app.asar`. |
+| `desktop/` | Launcher shell for configuration, gateway startup, and process monitoring. |
 
 This software **does not modify** Codex code. It only uses the corresponding Renderer artifacts.
 
@@ -56,9 +57,9 @@ flowchart TB
 
   L3["Renderer Compatibility Layer<br/>codex-bridge-polyfill<br/>Fills Electron Renderer runtime dependencies<br/>and converts Renderer calls into Web IPC"]
 
-  L4["Gateway Layer<br/>gateway<br/>Handles auth, HTTP / WebSocket, IPC dispatch<br/>and acts as the unified target-machine entry point"]
+  L4["Gateway Layer<br/>official-gateway<br/>Handles auth, HTTP / WebSocket<br/>and acts as the unified target-machine entry point"]
 
-  L5["Host Capability Adapter Layer<br/>Gateway IPC / electron-to-web / Direct IPC<br/>Adapts Desktop host semantics, local state, files, terminal, Git, and related capabilities"]
+  L5["Official Electron Runtime<br/>Hidden BrowserWindow + official IPC handlers<br/>Reuse Desktop host semantics and local capabilities"]
 
   L6["Codex Business Capability Layer<br/>Codex app-server<br/>Provides sessions, models, config, MCP, task execution, and other core capabilities"]
 
@@ -77,8 +78,9 @@ Core principles:
 
 - Reuse the official Renderer instead of rewriting the main UI.
 - Keep browser-side code focused on host-environment compatibility.
-- Let the gateway own local capabilities and app-server proxying, so remote browsers do not directly access local tokens or the app-server.
-- Record uncovered Desktop IPC calls in `reports/unknown-ipc.jsonl` and bridge them incrementally.
+- Keep gateway responsibilities limited to auth, transport, and official IPC hooks; sessions, terminal, Git, plugins, MCP, and similar business semantics continue to run through official handlers.
+- The app-server is started by the hidden official runtime using the official flow. OpenCodex only constrains that launch to the resolved Codex Desktop CLI.
+- IPC exceptions and unroutable official outbound messages are written to `reports/unknown-ipc.jsonl` for compatibility diagnostics.
 
 ## Requirements
 
@@ -86,15 +88,8 @@ Core principles:
 - pnpm
 - Codex Desktop installed locally, recommended, or explicit environment variables pointing to the Codex Desktop app or official bundle.
 - macOS / Windows. Launcher build commands are provided for both macOS and Windows.
-- Windows packaging requires Visual Studio 2022 C++ build tools and the Spectre-mitigated VC++ libraries for the target architecture. Otherwise, rebuilding the native `node-pty` module will fail.
 
 Install dependencies:
-
-Clone with submodules:
-
-```bash
-git clone --recursive xxx
-```
 
 ```bash
 pnpm install
@@ -109,7 +104,7 @@ A Launcher packaging entry point is currently available. On startup, it automati
 - Local access address, gateway process, and listening port.
 - Current Codex version, build, Codex installation path, `app.asar` path, and CLI path.
 - Config file, logs, reports, and official renderer cache directories.
-- Current app-server connection status.
+- Current official runtime / app-server connection status.
 - Access password settings. Authentication is disabled when the password is empty.
 - Startup address settings. Local mode listens on `127.0.0.1`; LAN mode listens on `0.0.0.0` and shows accessible LAN addresses.
 - Port settings. On first startup, the Launcher randomly chooses an available port and persists it. You can manually set the port later.
@@ -141,14 +136,14 @@ Artifacts are written to `release/`. The Launcher listens on `127.0.0.1` by defa
 Build macOS artifacts from a clean repository:
 
 ```bash
-git clone --recursive xxx
+git clone xxx
 cd OpenCodex
 pnpm install
 pnpm run build
 pnpm run desktop:dist:mac
 ```
 
-`desktop:dist:mac` first compiles `vendor/electron-to-web` and `gateway`, then uses `electron-builder` to generate `.dmg` and `.zip` artifacts. Outputs are written to `release/`:
+`desktop:dist:mac` first compiles `gateway/src/official`, then uses `electron-builder` to generate `.dmg` and `.zip` artifacts. Outputs are written to `release/`:
 
 ```text
 release/OpenCodex-<version>-arm64.dmg
@@ -176,14 +171,14 @@ The generated `.app` creates a user data directory on startup and stores Launche
 Build Windows artifacts from a clean repository:
 
 ```powershell
-git clone --recursive xxx
+git clone xxx
 cd OpenCodex
 pnpm install
 pnpm run build
 pnpm run desktop:dist:win
 ```
 
-`desktop:dist:win` first compiles `vendor/electron-to-web` and `gateway`, then uses `electron-builder` to generate an x64 NSIS installer and `.zip`. Outputs are written to `release/`.
+`desktop:dist:win` first compiles `gateway/src/official`, then uses `electron-builder` to generate an x64 NSIS installer and `.zip`. Outputs are written to `release/`.
 
 Debug an unpacked Windows application directory:
 
@@ -246,16 +241,17 @@ Use Tailscale, ZeroTier, a company VPN, or a similar private network solution fo
 | `CODEX_WEB_RUNTIME_DIR` | project directory | Gateway runtime directory. The Launcher sets this to the user data directory. |
 | `CODEX_WEB_CONFIG_PATH` | `config.yaml` | Access password configuration file path. |
 | `CODEX_WEB_REPORTS_DIR` | `reports` | Diagnostic reports directory. |
-| `CODEX_WEB_OFFICIAL_BUNDLE_DIR` | `cache/codex-official-bundle` | Cache directory for extracted official webview assets. |
-| `CODEX_WEB_IPC_IMPL` | `electron-to-web` | Set to `direct` to use the direct IPC fallback implementation. |
+| `CODEX_WEB_OFFICIAL_BUNDLE_DIR` | `runtime/cache/codex-official-bundle` | Runtime cache for the extracted official working copy; it is not bundled into dist and never writes back to the official installation. |
+| `CODEX_WEB_OFFICIAL_USER_DATA_DIR` | `runtime/official-user-data` | Electron profile directory for the hidden official runtime; isolated from Codex Desktop by default while still sharing `~/.codex`. |
+| `CODEX_WEB_OFFICIAL_TMPDIR` | `/tmp/opencodex-official-<uid>-<hash>` | Temporary directory for the hidden official runtime; isolates the official live IPC socket from Codex Desktop while still sharing `~/.codex`. |
 
 ## Files / Directories
 
 | Path | Description |
 | --- | --- |
-| `gateway/src/server.ts` | Gateway entry point. It wires HTTP, WebSocket, auth, official bundle loading, IPC, and app-server integration. |
-| `gateway/src/codex-app-server.ts` | Codex app-server client for connection management, request forwarding, startup cache warmup, and health status. |
-| `gateway/src/ipc/` | Gateway IPC abstractions and Electron/Codex compatibility implementations. |
+| `official-gateway/server.cjs` | Gateway entry point for HTTP, WebSocket, auth, and the official runtime. |
+| `official-gateway/official-runtime.cjs` | Loads the hidden official Electron runtime and hooks official IPC handlers, BrowserWindow, and app-server startup. |
+| `official-gateway/ws-hub.cjs` | Browser WebSocket connections, async IPC replies, and app-host MessagePort relay. |
 | `gateway/src/official/` | Codex Desktop `app.asar` scanning, identification, caching, and webview extraction. |
 | `web-shell/index.html` | Browser bootstrap shell for login, settings, and loading the patched official renderer. |
 | `web-shell/codex-bridge-polyfill.js` | Browser-side Electron/Codex bridge polyfill. |
@@ -265,10 +261,8 @@ Use Tailscale, ZeroTier, a company VPN, or a similar private network solution fo
 
 | Script | Description |
 | --- | --- |
-| `pnpm run build:gateway` | Compile `gateway/src` into `gateway/dist`. |
+| `pnpm run build:gateway` | Clean and compile `gateway/src/official` into `gateway/dist/official`. |
 | `pnpm run web:dev` | Start the compiled gateway. |
-| `pnpm run build:vendor` | Build `vendor/electron-to-web`. |
-| `pnpm run test:vendor` | Run `vendor/electron-to-web` tests. |
 | `pnpm run desktop:dev` | Compile and start the Launcher for debugging. |
 | `pnpm run desktop:pack:mac` | Generate an unpacked macOS `.app`. |
 | `pnpm run desktop:dist:mac` | Generate macOS `.dmg` and `.zip` artifacts. |

@@ -431,6 +431,8 @@
           mobileSidebarAutoCollapse: true,
         };
         let runtimeAuthToken = "";
+        // 登录成功后官方 renderer 会替换当前 document，但 window 对象仍会保留；这里把短期 token 暴露给 bridge 使用。
+        window.__OPEN_CODEX_RUNTIME_AUTH_TOKEN__ = "";
         const root = document.getElementById("root");
         const status = document.getElementById("status");
         const hint = document.getElementById("hint");
@@ -508,10 +510,12 @@
 
         function storeToken(token) {
           runtimeAuthToken = token || "";
+          window.__OPEN_CODEX_RUNTIME_AUTH_TOKEN__ = runtimeAuthToken;
         }
 
         function clearToken() {
           runtimeAuthToken = "";
+          window.__OPEN_CODEX_RUNTIME_AUTH_TOKEN__ = "";
         }
 
         function shouldForceLogin() {

@@ -5,8 +5,10 @@ const net = require("net");
 const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
+const { prepareOfficialElectronRuntime } = require("./official-electron-runtime.cjs");
 
 const APP_ROOT = path.resolve(__dirname, "..");
+
 const DEFAULT_HOST = process.env.OPENCODEX_HOST || "127.0.0.1";
 const DEFAULT_PORT = normalizePort(process.env.OPENCODEX_PORT);
 
@@ -28,6 +30,7 @@ const gatewayState = {
   status: null,
   lastError: "",
   startedAt: null,
+  officialRuntime: null,
 };
 
 function ensureDir(dirPath) {
@@ -59,7 +62,8 @@ function runtimePaths() {
     configPath: path.join(runtimeDir, "config.yaml"),
     settingsPath: path.join(userDataDir, "launcher-settings.json"),
     logPath: path.join(logsDir, "gateway.log"),
-    gatewayScriptPath: path.join(APP_ROOT, "gateway", "dist", "server.js"),
+    gatewayScriptPath: path.join(APP_ROOT, "gateway", "main.cjs"),
+    officialElectronRunnerDir: path.join(runtimeDir, "official-electron-runner"),
   };
 }
 
@@ -324,6 +328,7 @@ function buildState() {
     status: gatewayState.status,
     lastError: gatewayState.lastError,
     startedAt: gatewayState.startedAt,
+    officialRuntime: gatewayState.officialRuntime,
   };
 }
 
@@ -369,7 +374,7 @@ async function startGateway() {
   gatewayState.host = hostForMode(gatewayState.settings.hostMode);
 
   if (!fs.existsSync(paths.gatewayScriptPath)) {
-    gatewayState.lastError = `Missing gateway build: ${paths.gatewayScriptPath}`;
+    gatewayState.lastError = `Missing gateway entry: ${paths.gatewayScriptPath}`;
     broadcastState();
     return buildState();
   }
@@ -379,14 +384,40 @@ async function startGateway() {
   gatewayState.status = null;
   gatewayState.lastError = "";
   gatewayState.startedAt = new Date().toISOString();
+  gatewayState.officialRuntime = null;
 
   appendLog(`\n[launcher] starting gateway ${gatewayState.listenUrl} at ${gatewayState.startedAt}\n`);
 
-  const child = spawn(process.execPath, [paths.gatewayScriptPath], {
+  let officialRuntime;
+  try {
+    // gateway 必须运行在官方 Electron ABI 下，否则官方 native addon（例如 better-sqlite3）会随 Codex 升级失配。
+    officialRuntime = await prepareOfficialElectronRuntime({
+      runtimeDir: paths.runtimeDir,
+      officialBundleDir: paths.officialBundleDir,
+      logger: appendLog,
+    });
+    gatewayState.officialRuntime = officialRuntime;
+  } catch (error) {
+    gatewayState.lastError = error instanceof Error ? error.message : String(error);
+    appendLog(`[launcher] official Electron runtime prepare failed: ${gatewayState.lastError}\n`);
+    broadcastState();
+    return buildState();
+  }
+
+  const officialUserDataDir = path.join(paths.runtimeDir, "official-user-data");
+  const officialRuntimeArgs = [`--user-data-dir=${officialUserDataDir}`];
+  const child = spawn(officialRuntime.executablePath, officialRuntimeArgs, {
     cwd: APP_ROOT,
     env: {
       ...process.env,
-      ELECTRON_RUN_AS_NODE: "1",
+      OPENCODEX_GATEWAY_ENTRY: paths.gatewayScriptPath,
+      // runner 的 Info.plist 已经用 LSBackgroundOnly 隐藏；该标记让业务入口不要再调用 Dock API。
+      OPENCODEX_GATEWAY_AGENT_MODE: "1",
+      // 第 4 个 stdio fd 是生命周期 pipe；gateway 会监听它判断 launcher 是否已退出。
+      OPENCODEX_GATEWAY_LIFECYCLE_FD: "3",
+      // Chromium profile 必须和官方 Desktop 隔离；核心数据继续通过 CODEX_HOME 共享。
+      CODEX_WEB_OFFICIAL_USER_DATA_DIR: officialUserDataDir,
+      CODEX_ELECTRON_USER_DATA_PATH: officialUserDataDir,
       HOST: gatewayState.host,
       PORT: String(gatewayState.port),
       CODEX_WEB_RUNTIME_DIR: paths.runtimeDir,
@@ -396,7 +427,8 @@ async function startGateway() {
       CODEX_WEB_GATEWAY_BASE_URL: gatewayState.primaryUrl,
       CODEX_WEB_LAUNCHER_TOKEN: gatewayState.token,
     },
-    stdio: ["ignore", "pipe", "pipe"],
+    // 第 4 个 fd 是生命周期 pipe：launcher 退出时 OS 会关闭写端，gateway watchdog 会自杀。
+    stdio: ["ignore", "pipe", "pipe", "pipe"],
   });
 
   gatewayState.child = child;

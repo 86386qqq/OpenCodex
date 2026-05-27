@@ -7,7 +7,7 @@ OpenCodex 是一个 Codex 运行环境的轻量实现，通过它能把官方 Co
 一句话概括：
 
 ```text
-browser -> web-shell -> official Codex renderer -> bridge polyfill -> gateway -> Codex app-server / local host capabilities
+browser -> web-shell -> official Codex renderer -> bridge polyfill -> official-gateway -> hidden official Electron runtime
 ```
 
 ---
@@ -33,13 +33,14 @@ browser -> web-shell -> official Codex renderer -> bridge polyfill -> gateway ->
 
 ## 核心内容
 
-本项目包含三部分核心内容：
+本项目包含四部分核心内容：
 
 | 模块 | 作用 |
 | --- | --- |
 | `web-shell/` | 浏览器入口，用于加载官方 renderer 和搭建Render运行环境。 |
-| `gateway/` | 本地 Node gateway，提供 HTTP、WebSocket、IPC 兼容、本地文件、git、终端、状态同步和 app-server 转发。 |
-| `/electron-to-web/` | Electron 语义适配层，gateway 默认优先使用它来复用 Electron IPC 行为，另有自实现的DirectGatewayElectronIpcPort。 |
+| `official-gateway/` | 当前运行时入口，提供 HTTP、WebSocket、认证，并把浏览器 IPC 交给隐藏官方 Electron runtime 执行。 |
+| `gateway/src/official/` | 官方 Codex `app.asar` 扫描、识别、缓存和 renderer 工作副本抽取逻辑。 |
+| `desktop/` | Launcher 外壳，负责配置、启动和监控 gateway。 |
 
 本软件**不会修改**Codex的代码，仅使用对应Render产物。
 
@@ -55,9 +56,9 @@ flowchart TB
 
   L3["Renderer 兼容层<br/>codex-bridge-polyfill<br/>负责补齐 Electron Renderer 运行依赖<br/>并把 Renderer 调用转换为 Web IPC"]
 
-  L4["Gateway 层<br/>gateway<br/>负责认证、HTTP / WebSocket、IPC 分发<br/>以及目标机器侧的统一入口"]
+  L4["Gateway 层<br/>official-gateway<br/>负责认证、HTTP / WebSocket<br/>以及目标机器侧的统一入口"]
 
-  L5["宿主能力适配层<br/>Gateway IPC / electron-to-web / Direct IPC<br/>负责适配 Desktop 宿主语义、本地状态、文件、终端、Git 等能力"]
+  L5["官方 Electron Runtime<br/>隐藏 BrowserWindow + 官方 IPC handler<br/>负责复用 Desktop 宿主语义和本机能力"]
 
   L6["Codex 业务能力层<br/>Codex app-server<br/>负责会话、模型、配置、MCP、任务执行等核心业务能力"]
 
@@ -76,8 +77,9 @@ flowchart TB
 
 - 复用官方 Renderer，不重写主界面。
 - 浏览器侧只补宿主环境，不承接业务语义。
-- gateway 负责本地能力和 app-server 代理，避免远端浏览器直接接触本机 token 或 app-server。
-- 未覆盖的 Desktop IPC 通过 `reports/unknown-ipc.jsonl` 持续记录并补齐。
+- gateway 只负责认证、传输和官方 IPC hook；会话、终端、Git、插件、MCP 等业务语义继续走官方 handler。
+- app-server 由隐藏官方 runtime 按官方逻辑启动，OpenCodex 只把启动命令约束到解析出的 Codex Desktop CLI。
+- IPC 异常和无法路由的官方出站消息会写入 `reports/unknown-ipc.jsonl`，用于排查兼容性问题。
 
 ## 环境要求
 
@@ -85,14 +87,8 @@ flowchart TB
 - pnpm
 - 本机已安装 Codex Desktop（推荐），或通过环境变量显式指定 Codex Desktop / official bundle 路径。
 - macOS / Windows。macOS、Windows 均提供 Launcher 构建命令。
-- Windows 打包需要安装 Visual Studio 2022 C++ 构建工具，以及对应架构的 Spectre-mitigated VC++ 库，否则 `node-pty` 原生模块重编译会失败。
 
 依赖安装：
-
-注意要子模块取
-```
-git clone --recursive xxx
-```
 
 ```bash
 pnpm install
@@ -107,7 +103,7 @@ pnpm install
 - 本机访问地址、gateway 进程和监听端口。
 - 当前使用的 Codex 版本、build、Codex 安装路径、`app.asar` 路径和 CLI 路径。
 - 配置文件、日志、报告和 official renderer 缓存目录。
-- app-server 当前连接状态。
+- official runtime / app-server 当前连接状态。
 - 访问密码设置；密码为空时不启用认证。
 - 启动地址设置；本机模式监听 `127.0.0.1`，局域网模式监听 `0.0.0.0` 并展示可访问的局域网地址。
 - 端口设置；首次启动会随机选择一个可用端口并持久化，后续可手动指定端口。
@@ -139,14 +135,14 @@ pnpm run desktop:dist:win
 从干净仓库构建 macOS 产物：
 
 ```bash
-git clone --recursive xxx
+git clone xxx
 cd OpenCodex
 pnpm install
 pnpm run build
 pnpm run desktop:dist:mac
 ```
 
-`desktop:dist:mac` 会先编译 `vendor/electron-to-web` 和 `gateway`，再通过 `electron-builder` 生成 `.dmg` 和 `.zip`。产物位于 `release/`：
+`desktop:dist:mac` 会先编译 `gateway/src/official`，再通过 `electron-builder` 生成 `.dmg` 和 `.zip`。产物位于 `release/`：
 
 ```text
 release/OpenCodex-<version>-arm64.dmg
@@ -174,14 +170,14 @@ pnpm exec electron-builder --mac --dir --arm64
 从干净仓库构建 Windows 产物：
 
 ```powershell
-git clone --recursive xxx
+git clone xxx
 cd OpenCodex
 pnpm install
 pnpm run build
 pnpm run desktop:dist:win
 ```
 
-`desktop:dist:win` 会先编译 `vendor/electron-to-web` 和 `gateway`，再通过 `electron-builder` 生成 x64 NSIS 安装器和 `.zip`。产物位于 `release/`。
+`desktop:dist:win` 会先编译 `gateway/src/official`，再通过 `electron-builder` 生成 x64 NSIS 安装器和 `.zip`。产物位于 `release/`。
 
 调试未压缩 Windows 应用目录：
 
@@ -245,17 +241,18 @@ curl http://127.0.0.1:3737/api/health
 | `CODEX_WEB_RUNTIME_DIR` | 项目目录 | 指定 gateway 运行时目录；Launcher 会设置到用户数据目录。 |
 | `CODEX_WEB_CONFIG_PATH` | `config.yaml` | 指定访问密码配置文件路径。 |
 | `CODEX_WEB_REPORTS_DIR` | `reports` | 指定诊断报告目录。 |
-| `CODEX_WEB_OFFICIAL_BUNDLE_DIR` | `cache/codex-official-bundle` | 指定官方 webview 解包缓存目录。 |
-| `CODEX_WEB_IPC_IMPL` | `electron-to-web` | 设为 `direct` 可使用 direct IPC 兜底实现。 |
+| `CODEX_WEB_OFFICIAL_BUNDLE_DIR` | `runtime/cache/codex-official-bundle` | 指定运行时抽取的官方工作副本缓存目录；该目录不进入 dist，也不会回写官方安装源。 |
+| `CODEX_WEB_OFFICIAL_USER_DATA_DIR` | `runtime/official-user-data` | 指定隐藏官方 runtime 的 Electron profile 目录；默认和官方 Codex Desktop 隔离，但继续共享 `~/.codex`。 |
+| `CODEX_WEB_OFFICIAL_TMPDIR` | `/tmp/opencodex-official-<uid>-<hash>` | 指定隐藏官方 runtime 的临时目录；默认隔离官方 live IPC socket，避免和 Codex Desktop 抢同一会话 owner。 |
 
 
 ## 文件/目录说明
 
 | 路径 | 说明 |
 | --- | --- |
-| `gateway/src/server.ts` | gateway 启动入口，组装 HTTP、WebSocket、认证、official bundle、IPC 和 app-server。 |
-| `gateway/src/codex-app-server.ts` | Codex app-server 客户端，负责连接、请求转发、缓存预热和健康状态。 |
-| `gateway/src/ipc/` | gateway IPC 抽象和 Electron/Codex 兼容实现。 |
+| `official-gateway/server.cjs` | gateway 启动入口，组装 HTTP、WebSocket、认证和官方 runtime。 |
+| `official-gateway/official-runtime.cjs` | 加载隐藏官方 Electron runtime，hook 官方 IPC handler、BrowserWindow 和 app-server 启动。 |
+| `official-gateway/ws-hub.cjs` | 浏览器 WebSocket 连接、异步 IPC 回包和 app-host MessagePort 中继。 |
 | `gateway/src/official/` | Codex Desktop app.asar 扫描、识别、缓存和 webview 解包逻辑。 |
 | `web-shell/index.html` | 浏览器 bootstrap shell，负责登录页、设置入口和加载 patched official renderer。 |
 | `web-shell/codex-bridge-polyfill.js` | 浏览器侧 Electron/Codex bridge polyfill。 |
@@ -265,10 +262,8 @@ curl http://127.0.0.1:3737/api/health
 
 | 脚本 | 说明 |
 | --- | --- |
-| `pnpm run build:gateway` | 编译 `gateway/src` 到 `gateway/dist`。 |
+| `pnpm run build:gateway` | 清理并编译 `gateway/src/official` 到 `gateway/dist/official`。 |
 | `pnpm run web:dev` | 启动已编译的 gateway。 |
-| `pnpm run build:vendor` | 编译 `vendor/electron-to-web`。 |
-| `pnpm run test:vendor` | 运行 `vendor/electron-to-web` 测试。 |
 | `pnpm run desktop:dev` | 编译后启动 Launcher 调试。 |
 | `pnpm run desktop:pack:mac` | 生成未压缩的 macOS `.app`。 |
 | `pnpm run desktop:dist:mac` | 生成 macOS `.dmg` 和 `.zip` 产物。 |
