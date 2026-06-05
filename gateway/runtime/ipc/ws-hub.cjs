@@ -4,7 +4,27 @@ try {
 } catch {}
 const { diagnosticLog, diagnosticWarn, shortId } = require("../core/diagnostics.cjs");
 
+// 下面这些阈值只服务于 OPENCODEX_DEBUG_WS=1 的链路排障；默认运行不会采样慢 WS 发送。
+const WS_LARGE_MESSAGE_BYTES = Number(process.env.OPENCODEX_WS_LARGE_LOG_BYTES || 256 * 1024);
+const WS_SEND_SLOW_MS = Number(process.env.OPENCODEX_WS_SEND_SLOW_MS || 80);
+const WS_STRINGIFY_SLOW_MS = Number(process.env.OPENCODEX_WS_STRINGIFY_SLOW_MS || 20);
+const WS_BUFFERED_LOG_BYTES = Number(process.env.OPENCODEX_WS_BUFFERED_LOG_BYTES || 512 * 1024);
+const APP_HOST_TRAFFIC_FLUSH_MS = Number(process.env.OPENCODEX_APP_HOST_TRAFFIC_FLUSH_MS || 2000);
+const APP_HOST_LARGE_FRAME_BYTES = Number(process.env.OPENCODEX_APP_HOST_LARGE_FRAME_BYTES || 64 * 1024);
+// WS 压缩和 debug 采集分开控制：压缩默认开启，诊断默认关闭。
+const WS_DEFLATE_DISABLED = process.env.OPENCODEX_WS_DISABLE_DEFLATE === "1";
+const WS_DEFLATE_THRESHOLD = Number(process.env.OPENCODEX_WS_DEFLATE_THRESHOLD || 64 * 1024);
+const WS_DEFLATE_CONCURRENCY = Number(process.env.OPENCODEX_WS_DEFLATE_CONCURRENCY || 4);
+const WS_DEFLATE_LEVEL = Number(process.env.OPENCODEX_WS_DEFLATE_LEVEL || 3);
+const WS_DEBUG_ENABLED = process.env.OPENCODEX_DEBUG_WS === "1";
+
+function byteLength(value) {
+  // WebSocket bufferedAmount 用字节衡量；日志里也统一按 UTF-8 字节估算，方便对齐网络层现象。
+  return Buffer.byteLength(String(value || ""), "utf-8");
+}
+
 function routeIdFromPayload(value, depth = 0, seen = new WeakSet()) {
+  // 官方 IPC 版本变化时 requestId 可能藏在 payload/request/response/body 里，递归提取比写死类型更稳。
   if (!value || typeof value !== "object" || depth > 4) return "";
   if (seen.has(value)) return "";
   seen.add(value);
@@ -26,6 +46,7 @@ function routeIdFromPayload(value, depth = 0, seen = new WeakSet()) {
 }
 
 function wsPayloadSummary(payload) {
+  // 摘要只保留路由相关字段，不把正文、prompt、文件内容写进日志。
   const summary = {};
   if (payload && typeof payload === "object") {
     if (typeof payload.channel === "string") summary.channel = payload.channel;
@@ -42,6 +63,21 @@ function wsPayloadSummary(payload) {
   return summary;
 }
 
+function wsCompressionOptions() {
+  if (WS_DEFLATE_DISABLED) return false;
+  return {
+    // 只压缩大会话快照/历史消息这类大 JSON，小 IPC 保持原样，避免 CPU 成本抵消收益。
+    threshold: WS_DEFLATE_THRESHOLD,
+    // 不跨消息复用压缩上下文，降低内存占用和压缩侧信道风险。
+    clientNoContextTakeover: true,
+    serverNoContextTakeover: true,
+    concurrencyLimit: WS_DEFLATE_CONCURRENCY,
+    zlibDeflateOptions: {
+      level: WS_DEFLATE_LEVEL,
+    },
+  };
+}
+
 // ws-hub 不理解官方 IPC 协议，只负责维护连接和按 clientId 投递 JSON 消息。
 /** 创建 WebSocket hub，负责浏览器连接管理和 gateway 事件分发。 */
 function createWsHub(server, { createAppHostRelay, isAuthed }) {
@@ -49,22 +85,219 @@ function createWsHub(server, { createAppHostRelay, isAuthed }) {
     throw new Error("The ws package is required for gateway websocket support.");
   }
 
-  const wss = new WebSocketServer({ noServer: true });
+  const perMessageDeflate = wsCompressionOptions();
+  const wss = new WebSocketServer({ noServer: true, perMessageDeflate });
+  if (WS_DEBUG_ENABLED) {
+    // 压缩配置只在排障模式打印；压缩本身始终按上面的配置生效。
+    diagnosticLog("ws-hub", "compression_configured", {
+      debugWs: WS_DEBUG_ENABLED,
+      enabled: !!perMessageDeflate,
+      threshold: perMessageDeflate ? perMessageDeflate.threshold : 0,
+      concurrencyLimit: perMessageDeflate ? perMessageDeflate.concurrencyLimit : 0,
+      level: perMessageDeflate ? perMessageDeflate.zlibDeflateOptions.level : 0,
+    });
+  }
   const clients = new Set();
   // clientsById 是定向回包索引；clients 是广播索引，二者都需要维护。
   const clientsById = new Map();
   let lastAuthRejectLogAtMs = 0;
   let suppressedAuthRejectCount = 0;
+  const appHostTraffic = new Map();
+
+  function socketRemoteAddress(socket) {
+    return (socket && socket.__codexRemoteAddress) || "";
+  }
+
+  function socketClientId(socket) {
+    return (socket && socket.__codexWebClientId) || "";
+  }
+
+  function appHostTrafficKey(clientId, portId, direction) {
+    // app-host 一个页面可能同时有多个 MessagePort，聚合 key 必须带 portId 才不会混在一起。
+    return `${clientId || "unknown"}\n${portId || "unknown"}\n${direction || "unknown"}`;
+  }
+
+  function flushAppHostTraffic(key) {
+    if (!WS_DEBUG_ENABLED) return;
+    const stat = appHostTraffic.get(key);
+    if (!stat) return;
+    appHostTraffic.delete(key);
+    if (stat.timer) clearTimeout(stat.timer);
+    // app-host 是官方新版 renderer 的 MessagePort RPC 通道。这里做聚合日志，避免逐帧日志影响冷加载。
+    diagnosticLog("ws-hub", "app_host_traffic_summary", {
+      bytes: stat.bytes,
+      clientId: shortId(stat.clientId),
+      count: stat.count,
+      direction: stat.direction,
+      maxBytes: stat.maxBytes,
+      maxSendCallbackMs: stat.maxSendCallbackMs,
+      portId: shortId(stat.portId),
+      remoteAddress: stat.remoteAddress,
+      windowMs: Date.now() - stat.startedAtMs,
+    });
+  }
+
+  function recordAppHostTraffic(socket, direction, portId, dataBytes) {
+    if (!WS_DEBUG_ENABLED) return;
+    const clientId = socketClientId(socket);
+    const key = appHostTrafficKey(clientId, portId, direction);
+    let stat = appHostTraffic.get(key);
+    if (!stat) {
+      stat = {
+        bytes: 0,
+        clientId,
+        count: 0,
+        direction,
+        maxBytes: 0,
+        maxSendCallbackMs: 0,
+        portId,
+        remoteAddress: socketRemoteAddress(socket),
+        startedAtMs: Date.now(),
+        timer: null,
+      };
+      // 聚合窗口结束后只打一条 summary，避免 app-host 高频字符串帧把会话加载日志刷爆。
+      stat.timer = setTimeout(() => flushAppHostTraffic(key), APP_HOST_TRAFFIC_FLUSH_MS);
+      if (stat.timer && typeof stat.timer.unref === "function") stat.timer.unref();
+      appHostTraffic.set(key, stat);
+    }
+    stat.bytes += dataBytes;
+    stat.count += 1;
+    stat.maxBytes = Math.max(stat.maxBytes, dataBytes);
+  }
+
+  function recordAppHostSendCallback(socket, portId, sendCallbackMs) {
+    if (!WS_DEBUG_ENABLED) return;
+    const key = appHostTrafficKey(socketClientId(socket), portId, "official-to-browser");
+    const stat = appHostTraffic.get(key);
+    if (stat) stat.maxSendCallbackMs = Math.max(stat.maxSendCallbackMs, sendCallbackMs);
+  }
+
+  function flushAppHostTrafficForClient(clientId) {
+    if (!WS_DEBUG_ENABLED) return;
+    // 页面关闭时把该 client 的聚合窗口立即写出，方便复现后马上看完整统计。
+    for (const [key, stat] of appHostTraffic.entries()) {
+      if (stat.clientId === clientId) flushAppHostTraffic(key);
+    }
+  }
+
+  function appHostPayloadInfo(payload) {
+    // app-host-port-message.data 是官方 RPC 字符串；只统计长度，不解析内容，避免耦合官方协议细节。
+    if (!payload || payload.type !== "app-host-port-message" || typeof payload.data !== "string") return null;
+    return {
+      bytes: byteLength(payload.data),
+      portId: typeof payload.portId === "string" ? payload.portId : "",
+    };
+  }
+
+  function wsSendDiagnosticBase(socket, payload, route, messageBytes, stringifyMs, bufferedBefore, bufferedAfter, options = {}) {
+    // diagnosticSummary 来自 official-runtime 的原始请求摘要，可把大回包反查到 requestMethod/url。
+    return {
+      ...(options.diagnosticSummary && typeof options.diagnosticSummary === "object" ? options.diagnosticSummary : {}),
+      ...wsPayloadSummary(payload),
+      bufferedAfter,
+      bufferedBefore,
+      bytes: messageBytes,
+      clientId: shortId(socketClientId(socket)),
+      remoteAddress: socketRemoteAddress(socket),
+      route,
+      stringifyMs,
+    };
+  }
+
+  function shouldLogWsSend(messageBytes, stringifyMs, bufferedBefore, bufferedAfter) {
+    if (!WS_DEBUG_ENABLED) return false;
+    // 只在消息大、JSON 序列化慢或 socket 已经有明显积压时打慢日志。
+    return (
+      messageBytes >= WS_LARGE_MESSAGE_BYTES ||
+      stringifyMs >= WS_STRINGIFY_SLOW_MS ||
+      bufferedBefore >= WS_BUFFERED_LOG_BYTES ||
+      bufferedAfter >= WS_BUFFERED_LOG_BYTES
+    );
+  }
+
+  function sendPrepared(socket, payload, message, options = {}) {
+    /**
+     * 所有下行 WS 消息最终走这里：
+     * - 默认路径只做一次 socket.send，避免为了诊断增加常态开销。
+     * - OPENCODEX_DEBUG_WS=1 时才读取 bufferedAmount、统计字节数、挂 send callback。
+     */
+    const route = options.route || "send";
+    const stringifyMs = options.stringifyMs || 0;
+    const messageBytes = WS_DEBUG_ENABLED ? byteLength(message) : 0;
+    const appHostInfo = WS_DEBUG_ENABLED ? appHostPayloadInfo(payload) : null;
+    const bufferedBefore = WS_DEBUG_ENABLED ? Number(socket.bufferedAmount || 0) : 0;
+    let bufferedAfter = bufferedBefore;
+    const sendStartedAtMs = WS_DEBUG_ENABLED ? Date.now() : 0;
+    const needCallback =
+      WS_DEBUG_ENABLED &&
+      (shouldLogWsSend(messageBytes, stringifyMs, bufferedBefore, bufferedAfter) ||
+        (appHostInfo && appHostInfo.bytes >= APP_HOST_LARGE_FRAME_BYTES));
+    try {
+      if (appHostInfo) recordAppHostTraffic(socket, "official-to-browser", appHostInfo.portId, appHostInfo.bytes);
+      const onSent = (error) => {
+        const sendCallbackMs = Date.now() - sendStartedAtMs;
+        const doneBuffered = Number(socket.bufferedAmount || 0);
+        if (appHostInfo) recordAppHostSendCallback(socket, appHostInfo.portId, sendCallbackMs);
+        if (error) {
+          diagnosticWarn("ws-hub", "send_callback_failed", {
+            ...wsSendDiagnosticBase(socket, payload, route, messageBytes, stringifyMs, bufferedBefore, doneBuffered, options),
+            error: error instanceof Error ? error.message : String(error),
+            sendCallbackMs,
+          });
+          return;
+        }
+        if (
+          messageBytes >= WS_LARGE_MESSAGE_BYTES ||
+          sendCallbackMs >= WS_SEND_SLOW_MS ||
+          stringifyMs >= WS_STRINGIFY_SLOW_MS ||
+          bufferedBefore >= WS_BUFFERED_LOG_BYTES ||
+          doneBuffered >= WS_BUFFERED_LOG_BYTES
+        ) {
+          diagnosticLog("ws-hub", "send_large_or_slow", {
+            ...wsSendDiagnosticBase(socket, payload, route, messageBytes, stringifyMs, bufferedBefore, doneBuffered, options),
+            sendCallbackMs,
+          });
+        }
+      };
+      if (needCallback) {
+        socket.send(message, onSent);
+      } else {
+        socket.send(message);
+      }
+      bufferedAfter = WS_DEBUG_ENABLED ? Number(socket.bufferedAmount || 0) : 0;
+      if (shouldLogWsSend(messageBytes, stringifyMs, bufferedBefore, bufferedAfter) && !needCallback) {
+        diagnosticLog("ws-hub", "send_large_or_buffered", {
+          ...wsSendDiagnosticBase(socket, payload, route, messageBytes, stringifyMs, bufferedBefore, bufferedAfter, options),
+        });
+      }
+      return true;
+    } catch (error) {
+      diagnosticWarn("ws-hub", "send_failed", {
+        ...wsSendDiagnosticBase(socket, payload, route, messageBytes, stringifyMs, bufferedBefore, bufferedAfter, options),
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  function stringifyForWs(payload) {
+    // JSON.stringify 是必须成本；只有 debug 模式才额外记录它用了多久。
+    if (!WS_DEBUG_ENABLED) return { message: JSON.stringify(payload), stringifyMs: 0 };
+    const startedAtMs = Date.now();
+    const message = JSON.stringify(payload);
+    return { message, stringifyMs: Date.now() - startedAtMs };
+  }
 
   function safeSend(socket, payload, options = {}) {
     // 所有 WebSocket 下行都走这个出口，便于统一压日志和记录投递失败。
     if (!socket || socket.readyState !== socket.OPEN) return false;
     try {
-      socket.send(JSON.stringify(payload));
-      if (!options.suppressDiagnostic) {
+      const { message, stringifyMs } = stringifyForWs(payload);
+      const sent = sendPrepared(socket, payload, message, { ...options, route: options.route || "send", stringifyMs });
+      if (sent && !options.suppressDiagnostic) {
         diagnosticLog("ws-hub", "send", wsPayloadSummary(payload));
       }
-      return true;
+      return sent;
     } catch (error) {
       diagnosticWarn("ws-hub", "send_failed", {
         ...wsPayloadSummary(payload),
@@ -93,6 +326,7 @@ function createWsHub(server, { createAppHostRelay, isAuthed }) {
   }
 
   function removeClient(ws) {
+    flushAppHostTrafficForClient(socketClientId(ws));
     closeAppHostRelays(ws, "client_disconnected");
     clients.delete(ws);
     if (ws.__codexWebClientId && clientsById.get(ws.__codexWebClientId) === ws) {
@@ -117,14 +351,11 @@ function createWsHub(server, { createAppHostRelay, isAuthed }) {
 
   /** 向所有在线浏览器广播 gateway 消息。 */
   function broadcast(payload, options = {}) {
-    const message = JSON.stringify(payload);
+    const { message, stringifyMs } = stringifyForWs(payload);
     let sent = 0;
     for (const socket of clients) {
       if (socket.readyState !== socket.OPEN) continue;
-      try {
-        socket.send(message);
-        sent += 1;
-      } catch {}
+      if (sendPrepared(socket, payload, message, { ...options, route: "broadcast", stringifyMs })) sent += 1;
     }
     if (!options.suppressDiagnostic) {
       diagnosticLog("ws-hub", "broadcast", {
@@ -148,14 +379,15 @@ function createWsHub(server, { createAppHostRelay, isAuthed }) {
       return false;
     }
     try {
-      socket.send(JSON.stringify(payload));
-      if (!options.suppressDiagnostic) {
+      const { message, stringifyMs } = stringifyForWs(payload);
+      const sent = sendPrepared(socket, payload, message, { ...options, route: "send_to", stringifyMs });
+      if (sent && !options.suppressDiagnostic) {
         diagnosticLog("ws-hub", "send_to", {
           ...wsPayloadSummary(payload),
           clientId: shortId(clientId),
         });
       }
-      return true;
+      return sent;
     } catch (error) {
       diagnosticWarn("ws-hub", "send_to_failed", {
         ...wsPayloadSummary(payload),
@@ -300,6 +532,7 @@ function createWsHub(server, { createAppHostRelay, isAuthed }) {
       });
       return true;
     }
+    if (WS_DEBUG_ENABLED && typeof data === "string") recordAppHostTraffic(ws, "browser-to-official", portId, byteLength(data));
     relay.postMessage(data);
     // null 是关闭信号，发送给官方后即可从索引移除，后续 close 回调再到达也不会重复处理。
     if (data == null && relays.get(portId) === relay) relays.delete(portId);
@@ -326,10 +559,11 @@ function createWsHub(server, { createAppHostRelay, isAuthed }) {
       return socket.destroy();
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
+      ws.__codexRemoteAddress = req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : "";
       clients.add(ws);
       diagnosticLog("ws-hub", "connected", {
         clientCount: clients.size,
-        remoteAddress: req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : "",
+        remoteAddress: socketRemoteAddress(ws),
       });
       ws.on("message", (raw) => {
         try {
@@ -348,6 +582,7 @@ function createWsHub(server, { createAppHostRelay, isAuthed }) {
               clientId: shortId(clientId),
               clientCount: clients.size,
               mappedClientCount: clientsById.size,
+              remoteAddress: socketRemoteAddress(ws),
             });
             try {
               // ack 明确告诉浏览器：clientId 已经进入路由表，可以开始发会产生异步回包的官方 IPC。
