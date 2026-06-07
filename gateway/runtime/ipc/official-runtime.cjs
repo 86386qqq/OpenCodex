@@ -39,7 +39,6 @@ const requestContext = new AsyncLocalStorage();
 const requestRoutes = new Map();
 // requestRouteSummaries 保存 requestId 对应的入站摘要，让出站 fetch-response 日志也能带上原始 URL。
 const requestRouteSummaries = new Map();
-
 let officialBundle = null;
 let wsHub = null;
 
@@ -778,6 +777,13 @@ function parseFetchResponseBodyJson(payload) {
   }
 }
 
+function getI18nSnapshot() {
+  // gateway 运行在官方 Electron runtime 内，但 OpenCodex 自有文案只取当前系统语言，避免官方版本差异影响启动。
+  return resolveOpenCodexI18n({
+    systemLocales: [app && typeof app.getLocale === "function" ? app.getLocale() : ""],
+  });
+}
+
 function logComputerUseAuthResponse(routeBase, payload) {
   const action = computerUseAuthActionFromUrl(routeBase && routeBase.url);
   if (!action || !payload || typeof payload !== "object") return;
@@ -1316,16 +1322,14 @@ function buildGatewayStatus() {
     officialBundle: officialBundleStatus(),
     officialIpc: officialIpcStatus(),
     officialAppServer: appServerSpawnHookStatus(),
+    i18n: getI18nSnapshot(),
     workspaceRoots: workspaceRootsFromEnv(),
   };
 }
 
-function webConfigScript() {
+async function webConfigScript() {
   // 这个脚本由浏览器入口动态加载，避免把本机路径和端口写死到 web-shell 构建产物里。
-  const i18n = resolveOpenCodexI18n({
-    codexHome: CODEX_HOME,
-    systemLocales: [app && typeof app.getLocale === "function" ? app.getLocale() : ""],
-  });
+  const i18n = getI18nSnapshot();
   return `(() => {
   window.__CODEX_WEB_CONFIG__ = {
     gatewayBaseUrl: location.origin,
@@ -1333,6 +1337,8 @@ function webConfigScript() {
     workspaceRoots: ${JSON.stringify(workspaceRootsFromEnv())},
     homeDir: ${JSON.stringify(os.homedir())},
     locale: ${JSON.stringify(i18n.locale)},
+    localeSource: ${JSON.stringify(i18n.source || "")},
+    localeMode: ${JSON.stringify(i18n.mode || "")},
     messages: ${JSON.stringify(i18n.messages)},
     // debugWs 只控制浏览器侧诊断采集，不控制 WS 压缩；压缩属于 gateway 传输层优化。
     // OPENCODEX_DEBUG_WS=1 时才开启 WS 大包/慢解析诊断，平时不采集。
@@ -1365,7 +1371,7 @@ function startOfficialRuntime() {
 }
 
 function rejectPendingInternalResponses(error) {
-  // 当前 IPC 透明代理不再持有内部 MCP 请求；保留函数供 shutdown 流程统一调用。
+  // 当前没有 gateway 自己发起的官方 IPC 请求；保留出口让 shutdown 路径无需关心内部实现。
   void error;
 }
 
@@ -1379,6 +1385,7 @@ function listOfficialIpcChannels() {
 module.exports = {
   buildGatewayStatus,
   createOfficialAppHostRelay,
+  getI18nSnapshot,
   getOfficialBundle,
   invokeOfficialIpc,
   listOfficialIpcChannels,

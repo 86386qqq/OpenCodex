@@ -1,7 +1,6 @@
 const fs = require("fs");
 const path = require("path");
 const {
-  CODEX_HOME,
   PATCHED_OFFICIAL_PREFIX,
   WEB_SHELL_ASSETS_PREFIX,
   WEB_SHELL_DIR,
@@ -11,10 +10,9 @@ const {
   readText,
 } = require("../core/config.cjs");
 const { gzipIfUseful, send } = require("./http-utils.cjs");
-const { resolveOpenCodexI18n } = require("../../../shared/i18n/index.cjs");
 
 // 静态资源层把官方 renderer/web-shell 的路径差异统一隐藏起来，server 只需要按 URL 取文件。
-function createStaticAssetService({ getOfficialBundle }) {
+function createStaticAssetService({ getI18nSnapshot, getOfficialBundle }) {
   let hasWarnedHistoryPatchMiss = false;
   // 旧版本曾经使用 /official-patched/；浏览器缓存的旧 chunk 可能还会懒加载这个前缀。
   const patchedOfficialPrefixes = Array.from(new Set([PATCHED_OFFICIAL_PREFIX, "/official-patched/"]));
@@ -134,8 +132,8 @@ function createStaticAssetService({ getOfficialBundle }) {
   }
 
   function currentI18n() {
-    // web-shell 登录页在未认证时也需要知道语言；这里只注入语言和文案，不暴露路径、token 等运行时状态。
-    return resolveOpenCodexI18n({ codexHome: CODEX_HOME });
+    // web-shell 登录页在未认证时也需要知道语言；这里消费 runtime 注入的系统语言快照。
+    return typeof getI18nSnapshot === "function" ? getI18nSnapshot() : { locale: "en-US", messages: {} };
   }
 
   function patchHtmlLang(rawHtml, locale) {
@@ -149,6 +147,8 @@ function createStaticAssetService({ getOfficialBundle }) {
   function webShellBootstrapScript(i18n) {
     const publicConfig = {
       locale: i18n.locale,
+      localeSource: i18n.source || "",
+      localeMode: i18n.mode || "",
       messages: i18n.messages,
     };
     return `<script>window.__CODEX_WEB_CONFIG__=Object.assign(window.__CODEX_WEB_CONFIG__||{},${JSON.stringify(publicConfig)});</script>`;

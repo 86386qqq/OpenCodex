@@ -338,7 +338,7 @@ function buildState() {
 }
 
 function launcherI18n() {
-  // launcher 只复用 shared/i18n，不 import gateway；这样 desktop 仍然只是外壳进程。
+  // launcher 只根据 Electron 看到的系统语言渲染自有文案，不依赖 gateway 或官方 Codex 配置。
   return resolveOpenCodexI18n({
     systemLocales: [app && typeof app.getLocale === "function" ? app.getLocale() : ""],
   });

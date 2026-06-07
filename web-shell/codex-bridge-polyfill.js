@@ -7,6 +7,7 @@
       gatewayBaseUrl: location.origin,
       gatewayWsUrl: location.origin.replace(/^http/, "ws") + "/ws",
     });
+  // 语言只信任 gateway 启动配置；浏览器侧不自行读配置或按平台猜测。
   const OPENCODEX_LOCALE = cfg.locale || "zh-CN";
   const OPENCODEX_MESSAGES = cfg.messages && typeof cfg.messages === "object" ? cfg.messages : {};
   function t(key, values) {

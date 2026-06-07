@@ -28,6 +28,7 @@ const { createLocalFileService } = require("./http/local-files.cjs");
 const {
   buildGatewayStatus,
   createOfficialAppHostRelay,
+  getI18nSnapshot,
   getOfficialBundle,
   invokeOfficialIpc,
   listOfficialIpcChannels,
@@ -280,7 +281,7 @@ function createRequestHandler({ localFiles, staticAssets }) {
           "cache-control": "no-store",
           ...requestAuthRefreshHeaders,
         },
-        webConfigScript()
+        await webConfigScript()
       );
     }
 
@@ -421,7 +422,7 @@ async function createGateway() {
   await startOfficialRuntime();
 
   const localFiles = createLocalFileService();
-  const staticAssets = createStaticAssetService({ getOfficialBundle });
+  const staticAssets = createStaticAssetService({ getI18nSnapshot, getOfficialBundle });
   const requestHandler = createRequestHandler({ localFiles, staticAssets });
   const server = http.createServer((req, res) => {
     requestHandler(req, res).catch((error) => {

@@ -1,7 +1,3 @@
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
-
 const DEFAULT_LOCALE = "en-US";
 const ZH_CN = "zh-CN";
 const EN_US = "en-US";
@@ -11,12 +7,6 @@ const MESSAGES = {
   [ZH_CN]: require("./locales/zh-CN.json"),
   [EN_US]: require("./locales/en-US.json"),
 };
-
-const localeOverrideCache = new Map();
-
-function defaultCodexHome() {
-  return process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
-}
 
 function normalizeLocale(value, fallback = DEFAULT_LOCALE) {
   const raw = String(value || "").trim().replace(/_/g, "-").toLowerCase();
@@ -42,64 +32,6 @@ function t(locale, key, values) {
   return formatMessage(messagesForLocale(locale), key, values);
 }
 
-function stripTomlComment(value) {
-  let quote = "";
-  for (let i = 0; i < value.length; i += 1) {
-    const char = value[i];
-    if (quote === "\"") {
-      if (char === "\\") {
-        i += 1;
-        continue;
-      }
-      if (char === "\"") quote = "";
-      continue;
-    }
-    if (quote === "'") {
-      if (char === "'") quote = "";
-      continue;
-    }
-    if (char === "\"" || char === "'") {
-      quote = char;
-      continue;
-    }
-    if (char === "#") return value.slice(0, i);
-  }
-  return value;
-}
-
-function parseTomlStringScalar(rawValue) {
-  const value = stripTomlComment(String(rawValue || "")).trim();
-  if (!value || value === "null" || value === "~") return null;
-  if (value.startsWith("\"") && value.endsWith("\"")) {
-    try {
-      return JSON.parse(value);
-    } catch {
-      return null;
-    }
-  }
-  if (value.startsWith("'") && value.endsWith("'")) return value.slice(1, -1);
-  return value;
-}
-
-function readCodexLocaleOverride(codexHome = defaultCodexHome()) {
-  const configPath = path.join(codexHome, "config.toml");
-  try {
-    const stat = fs.statSync(configPath);
-    const cached = localeOverrideCache.get(configPath);
-    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.value;
-
-    // 官方 Codex 把界面语言写在 config.toml 的 localeOverride；这里只读这一项，避免碰触其它配置。
-    const raw = fs.readFileSync(configPath, "utf8");
-    const match = raw.match(/^\s*localeOverride\s*=\s*(.*)$/m);
-    const value = match ? parseTomlStringScalar(match[1]) : null;
-    const normalized = value ? normalizeLocale(value) : null;
-    localeOverrideCache.set(configPath, { mtimeMs: stat.mtimeMs, size: stat.size, value: normalized });
-    return normalized;
-  } catch {
-    return null;
-  }
-}
-
 function systemLocaleCandidates(extraCandidates) {
   const candidates = [];
   if (Array.isArray(extraCandidates)) candidates.push(...extraCandidates);
@@ -111,21 +43,7 @@ function systemLocaleCandidates(extraCandidates) {
 }
 
 function resolveOpenCodexLocale(options = {}) {
-  const explicitLocale = options.envLocale || process.env.OPENCODEX_LOCALE || process.env.CODEX_WEB_LOCALE;
-  if (explicitLocale) {
-    return { locale: normalizeLocale(explicitLocale), source: "env" };
-  }
-
-  const codexHome = options.codexHome || defaultCodexHome();
-  const codexLocale = readCodexLocaleOverride(codexHome);
-  if (codexLocale) {
-    return { locale: codexLocale, source: "codex-config" };
-  }
-
-  /**
-   * localeOverride 为空代表官方的 Auto Detect。
-   * OpenCodex 只维护中英文文案，所以系统语言不是中文时统一落到英文。
-   */
+  // OpenCodex 自有文案只跟随系统语言；不读官方配置，也不依赖官方 IPC 是否存在。
   const candidates = systemLocaleCandidates(options.systemLocales);
   const zhCandidate = candidates.find((candidate) => normalizeLocale(candidate, "") === ZH_CN);
   return { locale: zhCandidate ? ZH_CN : EN_US, source: zhCandidate ? "system" : "default" };
@@ -147,7 +65,6 @@ module.exports = {
   formatMessage,
   messagesForLocale,
   normalizeLocale,
-  readCodexLocaleOverride,
   resolveOpenCodexI18n,
   resolveOpenCodexLocale,
   t,
