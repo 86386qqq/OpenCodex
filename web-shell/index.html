@@ -145,6 +145,10 @@
         font-size: var(--text-sm, 13px);
         line-height: 18px;
       }
+      /* 错误文案为空时不预留高度，避免登录按钮下方出现多余空白。 */
+      .error:empty {
+        display: none;
+      }
       .hidden {
         display: none;
       }
