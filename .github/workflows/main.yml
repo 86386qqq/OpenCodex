@@ -1,0 +1,32 @@
+name: Windows打包EXE
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 配置Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 安装pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: 安装Rust编译工具
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 安装项目依赖
+        run: cd desktop && pnpm install
+
+      - name: 编译打包
+        run: cd desktop && pnpm tauri build
+
+      - name: 导出EXE安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenCodex-Win安装包
+          path: desktop/src-tauri/target/release/bundle/msi/*.exe
