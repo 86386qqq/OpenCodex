@@ -9,24 +9,26 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: 配置Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v2
         with:
           node-version: 20
 
       - name: 安装pnpm
         uses: pnpm/action-setup@v4
+        with:
+          version: 9
 
-      - name: 安装Rust编译工具
+      - name: 安装Rust编译工具链
         uses: dtolnay/rust-toolchain@stable
 
-      - name: 安装项目依赖
+      - name: 安装项目全部依赖
         run: cd desktop && pnpm install
 
-      - name: 编译打包
+      - name: Tauri编译打包Windows安装程序
         run: cd desktop && pnpm tauri build
 
-      - name: 导出EXE安装包
+      - name: 上传打包后的EXE安装包
         uses: actions/upload-artifact@v4
         with:
-          name: OpenCodex-Win安装包
+          name: OpenCodex-Windows安装包
           path: desktop/src-tauri/target/release/bundle/msi/*.exe
